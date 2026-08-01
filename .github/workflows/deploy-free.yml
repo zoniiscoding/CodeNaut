@@ -44,7 +44,7 @@ jobs:
           test "${#EXPECTED_SHA}" -eq 40
 
       - name: Check out the requested immutable source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.commit_sha }}
           persist-credentials: false
@@ -63,7 +63,7 @@ jobs:
     environment: production
     steps:
       - name: Check out the requested immutable source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.commit_sha }}
           persist-credentials: false
@@ -97,7 +97,7 @@ jobs:
       embedding-image: ${{ steps.tags.outputs.embedding }}
     steps:
       - name: Check out the requested immutable source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.commit_sha }}
           persist-credentials: false
@@ -294,7 +294,7 @@ jobs:
       API_PROXY_TARGET: ${{ vars.PRODUCTION_API_ORIGIN }}/api/v1
     steps:
       - name: Check out the requested immutable source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.commit_sha }}
           persist-credentials: false
@@ -320,7 +320,7 @@ jobs:
       PRODUCTION_FRONTEND_ORIGIN: ${{ vars.PRODUCTION_FRONTEND_ORIGIN }}
     steps:
       - name: Check out the requested immutable source
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.commit_sha }}
           persist-credentials: false
