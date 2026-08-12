@@ -1,0 +1,722 @@
+"""Validated environment configuration with secret-safe representations."""
+
+from enum import StrEnum
+from pathlib import Path
+from typing import Any, Self
+from urllib.parse import urlsplit
+
+from pydantic import (
+    AliasChoices,
+    AnyHttpUrl,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
+
+MINIMUM_SECRET_LENGTH = 32
+OPENAI_API_BASE_URL = "https://api.openai.com/v1"
+GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+GROQ_API_BASE_URL = "https://api.groq.com/openai/v1"
+SUPPORTED_LLM_API_BASE_URLS = frozenset(
+    {OPENAI_API_BASE_URL, GEMINI_API_BASE_URL, GROQ_API_BASE_URL}
+)
+_PLACEHOLDER_MARKERS = (
+    "change-me",
+    "changeme",
+    "ci-only",
+    "example-secret",
+    "placeholder",
+    "replace-me",
+    "test-only",
+)
+_MAX_PLACEHOLDER_UNIQUE_CHARACTERS = 2
+_KNOWN_WEAK_VALUES = frozenset({"password", "password123", "postgres", "redis", "secret"})
+
+
+def _origin(url: AnyHttpUrl) -> str:
+    """Return a normalized origin; frontend redirects must never carry a path or query."""
+    parsed = urlsplit(str(url))
+    if (
+        parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError(
+            "FRONTEND_URL must be an origin without credentials, path, query, or fragment"
+        )
+    return f"{parsed.scheme}://{parsed.netloc}".lower()
+
+
+def _normalized_service_url(url: AnyHttpUrl) -> str:
+    parsed = urlsplit(str(url))
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Service URLs must not contain credentials, query, or fragment")
+    return str(url).rstrip("/")
+
+
+def _is_railway_private_host(hostname: str | None) -> bool:
+    """Match only a named Railway private-DNS service, never a suffix lookalike."""
+    if hostname is None:
+        return False
+    normalized = hostname.rstrip(".").lower()
+    service, separator, suffix = normalized.partition(".")
+    return bool(service and separator and suffix == "railway.internal")
+
+
+def _is_loopback_host(hostname: str | None) -> bool:
+    """Match only literal loopback addresses, trusted because traffic never leaves the host."""
+    if hostname is None:
+        return False
+    return hostname.rstrip(".").lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+def _validated_database_url(value: SecretStr, *, variable_name: str) -> SecretStr:
+    """Validate one async PostgreSQL URL without including it in an error."""
+    raw_url = value.get_secret_value()
+    try:
+        parsed = make_url(raw_url)
+    except ArgumentError as error:
+        raise ValueError(f"{variable_name} must be a valid SQLAlchemy URL") from error
+    if parsed.drivername != "postgresql+asyncpg":
+        raise ValueError(f"{variable_name} must use the postgresql+asyncpg driver")
+    if not parsed.host or not parsed.database:
+        raise ValueError(f"{variable_name} must include a host and database name")
+    return value
+
+
+def _looks_like_placeholder(value: str) -> bool:
+    normalized = value.strip().casefold()
+    return (
+        normalized in _KNOWN_WEAK_VALUES
+        or any(marker in normalized for marker in _PLACEHOLDER_MARKERS)
+        or len(set(normalized)) <= _MAX_PLACEHOLDER_UNIQUE_CHARACTERS
+    )
+
+
+class AppEnvironment(StrEnum):
+    """Supported runtime environments."""
+
+    DEVELOPMENT = "development"
+    TEST = "test"
+    PRODUCTION = "production"
+
+
+class LLMProvider(StrEnum):
+    """Supported answer-synthesis providers."""
+
+    OPENAI = "openai"
+    DETERMINISTIC = "deterministic"
+
+
+class ServiceRole(StrEnum):
+    """Executable roles with intentionally different production secret sets."""
+
+    API = "api"
+    WORKER = "worker"
+
+
+class Settings(BaseSettings):
+    """Application settings loaded exclusively from environment or local `.env`."""
+
+    model_config = SettingsConfigDict(
+        env_file=(".env", "../.env"),
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+        validate_default=True,
+    )
+
+    app_name: str = "RepoLume API"
+    app_env: AppEnvironment = AppEnvironment.DEVELOPMENT
+    service_role: ServiceRole = ServiceRole.API
+    database_url: SecretStr
+    redis_url: SecretStr
+    log_level: str = "INFO"
+    log_json: bool = False
+    docs_enabled: bool = True
+
+    database_pool_size: int = Field(default=5, ge=1, le=50)
+    database_max_overflow: int = Field(default=10, ge=0, le=100)
+    database_pool_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
+    database_ready_timeout_seconds: float = Field(default=2.0, gt=0, le=10)
+
+    github_app_id: int = Field(gt=0)
+    github_client_id: str = Field(default="", max_length=255)
+    github_client_secret: SecretStr = SecretStr("")
+    github_app_private_key: SecretStr
+    github_webhook_secret: SecretStr = SecretStr("")
+    github_oauth_callback_url: AnyHttpUrl = AnyHttpUrl(
+        "http://127.0.0.1:8000/api/v1/auth/github/callback"
+    )
+    github_public_api_token: SecretStr = SecretStr("")
+    frontend_url: AnyHttpUrl | None = None
+
+    google_auth_enabled: bool = False
+    google_client_id: str = Field(default="", max_length=255)
+    google_client_secret: SecretStr = SecretStr("")
+    google_oauth_callback_url: AnyHttpUrl | None = None
+
+    access_token_secret: SecretStr = SecretStr("")
+    token_hash_secret: SecretStr = SecretStr("")
+    access_token_ttl_seconds: int = Field(default=900, ge=300, le=1800)
+    refresh_token_ttl_seconds: int = Field(default=2_592_000, ge=3600, le=7_776_000)
+    oauth_state_ttl_seconds: int = Field(default=600, ge=120, le=900)
+    installation_membership_ttl_seconds: int = Field(default=28_800, ge=900, le=86_400)
+    public_repository_visibility_ttl_seconds: int = Field(default=900, ge=60, le=86_400)
+    public_repository_limit_per_user: int = Field(default=20, ge=1, le=500)
+    public_import_active_limit_per_user: int = Field(default=2, ge=1, le=20)
+    public_github_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+    refresh_cookie_name: str = Field(default="repolume_refresh_token", pattern=r"^[a-z0-9_]+$")
+
+    worker_stream_name: str = Field(default="repolume:indexing", pattern=r"^[a-z0-9:_-]+$")
+    worker_consumer_group: str = Field(default="repolume-workers", pattern=r"^[a-z0-9:_-]+$")
+    worker_poll_timeout_ms: int = Field(default=1_000, ge=100, le=30_000)
+    worker_reconcile_interval_seconds: float = Field(default=5.0, ge=0.1, le=60)
+    worker_heartbeat_interval_seconds: float = Field(default=5.0, ge=0.1, le=60)
+    worker_abandoned_after_seconds: int = Field(default=30, ge=5, le=600)
+    worker_max_attempts: int = Field(default=3, ge=1, le=10)
+    worker_retry_base_seconds: int = Field(default=2, ge=1, le=300)
+    worker_retry_max_seconds: int = Field(default=60, ge=1, le=3_600)
+    worker_stream_max_length: int = Field(default=10_000, ge=100, le=1_000_000)
+    freshness_max_changed_files: int = Field(default=300, ge=1, le=3_000)
+    freshness_max_changed_bytes: int = Field(
+        default=64 * 1024 * 1024, ge=1024, le=512 * 1024 * 1024
+    )
+
+    clone_git_executable: Path = Path("/usr/bin/git")
+    clone_timeout_seconds: int = Field(default=120, ge=5, le=900)
+    clone_max_repository_bytes: int = Field(default=500 * 1024 * 1024, ge=1024)
+    clone_max_file_bytes: int = Field(default=2 * 1024 * 1024, ge=1024)
+    clone_max_file_count: int = Field(default=20_000, ge=1)
+    clone_max_discovered_bytes: int = Field(default=250 * 1024 * 1024, ge=1024)
+    clone_process_memory_bytes: int = Field(default=1024 * 1024 * 1024, ge=64 * 1024 * 1024)
+    clone_process_cpu_seconds: int = Field(default=120, ge=5, le=900)
+
+    parser_max_input_bytes: int = Field(default=2 * 1024 * 1024, ge=1024)
+    parser_max_symbols_per_file: int = Field(default=5_000, ge=1, le=100_000)
+    parser_max_symbol_bytes: int = Field(default=512 * 1024, ge=1024)
+    parser_max_chunk_bytes: int = Field(default=32 * 1024, ge=512)
+    parser_max_chunks_per_file: int = Field(default=2_000, ge=1, le=100_000)
+    parser_max_total_chunks: int = Field(default=50_000, ge=1, le=1_000_000)
+    parser_max_total_chunk_bytes: int = Field(default=64 * 1024 * 1024, ge=1024)
+    parser_max_document_section_bytes: int = Field(default=256 * 1024, ge=1024)
+    parser_max_warnings_per_file: int = Field(default=50, ge=1, le=1_000)
+    parser_max_call_sites_per_file: int = Field(default=10_000, ge=1, le=200_000)
+    parser_max_total_call_sites: int = Field(default=100_000, ge=1, le=2_000_000)
+    parser_max_call_expression_bytes: int = Field(default=2048, ge=32, le=16_384)
+    parser_timeout_seconds: float = Field(default=180.0, gt=0, le=900)
+    parser_process_memory_bytes: int = Field(default=2 * 1024 * 1024 * 1024, ge=64 * 1024 * 1024)
+    parser_process_cpu_seconds: int = Field(default=120, ge=5, le=900)
+
+    embedding_service_url: AnyHttpUrl = AnyHttpUrl("http://127.0.0.1:8100")
+    embedding_service_token: SecretStr
+    embedding_model_identifier: str = "jinaai/jina-embeddings-v2-base-code"
+    embedding_model_revision: str = "516f4baf13dec4ddddda8631e019b5737c8bc250"
+    embedding_dimension: int = Field(default=768, ge=1, le=65_536)
+    embedding_preprocessing_version: str = Field(
+        default="repolume-embedding-v1",
+        pattern=r"^[a-z0-9._-]+$",
+    )
+    embedding_batch_size: int = Field(default=16, ge=1, le=256)
+    embedding_max_document_bytes: int = Field(default=48 * 1024, ge=1024)
+    embedding_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    embedding_read_timeout_seconds: float = Field(default=60.0, gt=0, le=300)
+    embedding_max_attempts: int = Field(default=3, ge=1, le=10)
+    embedding_retry_base_seconds: float = Field(default=0.25, gt=0, le=10)
+
+    qdrant_url: AnyHttpUrl = AnyHttpUrl("http://127.0.0.1:6333")
+    qdrant_api_key: SecretStr = SecretStr("")
+    qdrant_collection_name: str = Field(
+        default="repolume_chunks",
+        pattern=r"^[a-zA-Z0-9_-]+$",
+    )
+    qdrant_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
+    qdrant_upsert_batch_size: int = Field(default=128, ge=1, le=1_000)
+    qdrant_max_attempts: int = Field(default=3, ge=1, le=10)
+    qdrant_retry_base_seconds: float = Field(default=0.25, gt=0, le=10)
+
+    rag_question_min_characters: int = Field(default=3, ge=1, le=64)
+    rag_question_max_bytes: int = Field(default=4096, ge=64, le=16_384)
+    rag_question_max_tokens: int = Field(default=512, ge=16, le=2_048)
+    rag_retrieval_top_k: int = Field(default=6, ge=1, le=20)
+    rag_retrieval_overfetch: int = Field(default=12, ge=1, le=50)
+    rag_retrieval_score_threshold: float = Field(default=0.25, ge=-1, le=1)
+    rag_max_evidence_per_file: int = Field(default=3, ge=1, le=10)
+    rag_max_evidence_bytes: int = Field(default=32 * 1024, ge=1024, le=256 * 1024)
+    rag_max_evidence_item_bytes: int = Field(default=12 * 1024, ge=512, le=64 * 1024)
+    rag_total_timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+
+    llm_provider: LLMProvider = LLMProvider.OPENAI
+    llm_api_url: AnyHttpUrl = AnyHttpUrl("https://api.openai.com/v1")
+    llm_api_key: SecretStr = SecretStr("")
+    llm_model: str = Field(
+        default="gpt-5.4-mini-2026-03-17",
+        pattern=r"^[A-Za-z0-9._-]+$",
+    )
+    llm_prompt_version: str = Field(default="repolume-grounded-v1", pattern=r"^[a-z0-9._-]+$")
+    llm_max_output_tokens: int = Field(default=1200, ge=128, le=8192)
+    llm_max_answer_characters: int = Field(default=8000, ge=256, le=32_000)
+    llm_connect_timeout_seconds: float = Field(default=3.0, gt=0, le=30)
+    llm_read_timeout_seconds: float = Field(default=20.0, gt=0, le=90)
+    llm_max_attempts: int = Field(default=2, ge=1, le=4)
+    llm_retry_base_seconds: float = Field(default=0.25, gt=0, le=5)
+    llm_max_concurrent_requests: int = Field(default=8, ge=1, le=100)
+
+    agent_max_tool_calls: int = Field(default=4, ge=1, le=4)
+    agent_tool_timeout_seconds: float = Field(default=8.0, gt=0, le=8)
+    agent_provider_timeout_seconds: float = Field(default=20.0, gt=0, le=60)
+    agent_total_timeout_seconds: float = Field(default=45.0, gt=0, le=120)
+    agent_max_tool_result_bytes: int = Field(default=32 * 1024, ge=1024, le=128 * 1024)
+    agent_max_total_evidence_bytes: int = Field(default=64 * 1024, ge=1024, le=256 * 1024)
+    agent_history_commit_limit: int = Field(default=3, ge=1, le=10)
+    agent_history_max_message_bytes: int = Field(default=2048, ge=128, le=8192)
+    agent_history_max_patch_bytes: int = Field(default=8192, ge=256, le=32 * 1024)
+    agent_history_max_paths: int = Field(default=20, ge=1, le=100)
+    agent_caller_result_limit: int = Field(default=20, ge=1, le=100)
+    agent_max_final_output_tokens: int = Field(default=1200, ge=128, le=8192)
+
+    question_rate_limit_enabled: bool = True
+    question_rate_limit_per_minute: int = Field(default=10, ge=1, le=600)
+    question_rate_limit_per_day: int = Field(default=300, ge=1, le=100_000)
+
+    cors_origins: list[AnyHttpUrl] = Field(default_factory=list)
+    trusted_hosts: list[str] = Field(default_factory=lambda: ["localhost", "127.0.0.1"])
+
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url(cls, value: SecretStr) -> SecretStr:
+        """Require the async PostgreSQL SQLAlchemy driver and a named database."""
+        return _validated_database_url(value, variable_name="DATABASE_URL")
+
+    @field_validator("redis_url")
+    @classmethod
+    def validate_redis_url(cls, value: SecretStr) -> SecretStr:
+        """Require a network Redis URL without exposing its credentials."""
+        parsed = urlsplit(value.get_secret_value())
+        if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
+            raise ValueError("REDIS_URL must use redis:// or rediss:// and include a host")
+        return value
+
+    @field_validator("clone_git_executable")
+    @classmethod
+    def validate_git_executable(cls, value: Path) -> Path:
+        """Use an explicit absolute Git binary, never PATH lookup."""
+        if not value.is_absolute():
+            raise ValueError("CLONE_GIT_EXECUTABLE must be an absolute path")
+        return value
+
+    @field_validator("frontend_url")
+    @classmethod
+    def validate_frontend_url(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:
+        """Accept only an origin for the post-OAuth browser redirect."""
+        if value is not None:
+            _origin(value)
+        return value
+
+    @field_validator("cors_origins")
+    @classmethod
+    def validate_cors_origins(cls, value: list[AnyHttpUrl]) -> list[AnyHttpUrl]:
+        """CORS entries are origins, never credentialed URLs or path prefixes."""
+        for origin in value:
+            _origin(origin)
+        return value
+
+    @field_validator("github_oauth_callback_url")
+    @classmethod
+    def validate_github_callback_url(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        """Bind GitHub OAuth completion to the one application callback path."""
+        cls._validate_callback_url(value, "/api/v1/auth/github/callback")
+        return value
+
+    @field_validator("google_oauth_callback_url")
+    @classmethod
+    def validate_google_callback_url(cls, value: AnyHttpUrl | None) -> AnyHttpUrl | None:
+        """Accept a fixed HTTP(S) callback; production HTTPS is checked below."""
+        if value is not None:
+            cls._validate_callback_url(value, "/api/v1/auth/google/callback")
+        return value
+
+    @field_validator("embedding_service_url", "qdrant_url", "llm_api_url")
+    @classmethod
+    def validate_service_url(cls, value: AnyHttpUrl) -> AnyHttpUrl:
+        _normalized_service_url(value)
+        return value
+
+    @field_validator("log_level")
+    @classmethod
+    def validate_log_level(cls, value: str) -> str:
+        """Normalize and restrict logging levels."""
+        normalized = value.upper()
+        if normalized not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("LOG_LEVEL is not supported")
+        return normalized
+
+    @field_validator("embedding_service_token")
+    @classmethod
+    def validate_secret_length(cls, value: SecretStr) -> SecretStr:
+        """Reject secrets that do not provide a minimally useful entropy budget."""
+        if len(value.get_secret_value()) < MINIMUM_SECRET_LENGTH:
+            raise ValueError(
+                "Configured authentication secrets must contain at least 32 characters"
+            )
+        return value
+
+    @field_validator("github_app_private_key")
+    @classmethod
+    def validate_private_key(cls, value: SecretStr) -> SecretStr:
+        """Normalize and require a PEM-shaped private key, never returning its content.
+
+        A PEM is multi-line, but dotenv and most secret stores carry single-line
+        values, so the key normally arrives with literal backslash-n escapes.
+        Convert those to real newlines here; signing rejects the escaped form.
+        """
+        raw_value = value.get_secret_value().strip()
+        if "\\n" in raw_value and "\n" not in raw_value:
+            raw_value = raw_value.replace("\\n", "\n")
+        if "-----BEGIN" not in raw_value or "PRIVATE KEY-----" not in raw_value:
+            raise ValueError("GITHUB_APP_PRIVATE_KEY must be PEM encoded")
+        return SecretStr(raw_value)
+
+    @field_validator("trusted_hosts")
+    @classmethod
+    def validate_trusted_hosts(cls, value: list[str]) -> list[str]:
+        """Reject empty host entries."""
+        if not value or any(not host.strip() for host in value):
+            raise ValueError("TRUSTED_HOSTS must contain explicit non-empty hosts")
+        return value
+
+    @model_validator(mode="after")
+    def validate_production_security(self) -> Self:
+        """Fail closed when production-only security settings are unsafe."""
+        if not self.is_production:
+            return self
+
+        if not self.log_json:
+            raise ValueError("LOG_JSON must be true in production")
+        if self.docs_enabled:
+            raise ValueError("DOCS_ENABLED must be false in production")
+        if self.service_role is ServiceRole.API:
+            self._validate_production_api_surface()
+
+        self._validate_production_backing_services()
+        self._validate_production_credentials()
+        return self
+
+    def _validate_production_api_surface(self) -> None:
+        if not self.cors_origins:
+            raise ValueError("CORS_ORIGINS must be explicit in production")
+        if any(origin.scheme != "https" for origin in self.cors_origins):
+            raise ValueError("CORS_ORIGINS must use HTTPS in production")
+        if self.github_oauth_callback_url.scheme != "https":
+            raise ValueError("GITHUB_OAUTH_CALLBACK_URL must use HTTPS in production")
+        if self.google_auth_enabled and (
+            self.google_oauth_callback_url is None
+            or self.google_oauth_callback_url.scheme != "https"
+        ):
+            raise ValueError("GOOGLE_OAUTH_CALLBACK_URL must use HTTPS in production")
+        if self.frontend_url is None:
+            raise ValueError("FRONTEND_URL must be explicit in production")
+        if self.frontend_url.scheme != "https":
+            raise ValueError("FRONTEND_URL must use HTTPS in production")
+        if _origin(self.frontend_url) not in {_origin(origin) for origin in self.cors_origins}:
+            raise ValueError("FRONTEND_URL must be an allowed CORS origin")
+
+        callback_hosts = {self.github_oauth_callback_url.host}
+        if self.google_auth_enabled and self.google_oauth_callback_url is not None:
+            callback_hosts.add(self.google_oauth_callback_url.host)
+        if not callback_hosts.issubset(set(self.trusted_hosts)):
+            raise ValueError("OAuth callback hosts must be present in TRUSTED_HOSTS")
+
+    @model_validator(mode="after")
+    def validate_google_authentication(self) -> Self:
+        """Require a complete Google OIDC configuration only when enabled."""
+        if not self.google_auth_enabled:
+            return self
+        if not self.google_client_id.strip() or self.google_oauth_callback_url is None:
+            raise ValueError("Google authentication is enabled but configuration is incomplete")
+        if len(self.google_client_secret.get_secret_value()) < MINIMUM_SECRET_LENGTH:
+            raise ValueError("GOOGLE_CLIENT_SECRET must contain at least 32 characters")
+        return self
+
+    @model_validator(mode="after")
+    def validate_role_credentials(self) -> Self:
+        """Require API-only credentials only in the public API process."""
+        if self.service_role is ServiceRole.WORKER:
+            return self
+        credentials = {
+            "GITHUB_CLIENT_SECRET": self.github_client_secret.get_secret_value(),
+            "GITHUB_WEBHOOK_SECRET": self.github_webhook_secret.get_secret_value(),
+            "ACCESS_TOKEN_SECRET": self.access_token_secret.get_secret_value(),
+            "TOKEN_HASH_SECRET": self.token_hash_secret.get_secret_value(),
+        }
+        invalid = next(
+            (
+                name
+                for name, credential in credentials.items()
+                if len(credential) < MINIMUM_SECRET_LENGTH
+            ),
+            None,
+        )
+        if not self.github_client_id.strip():
+            raise ValueError("GITHUB_CLIENT_ID must be configured for the API service")
+        if invalid is not None:
+            raise ValueError(f"{invalid} must contain at least 32 characters")
+        return self
+
+    def _validate_production_backing_services(self) -> None:
+        """Require authenticated remote infrastructure over encrypted transports."""
+
+        forbidden_hosts = {"*", "localhost", "127.0.0.1", "0.0.0.0"}
+        if self.service_role is ServiceRole.API and any(
+            host.lower() in forbidden_hosts for host in self.trusted_hosts
+        ):
+            raise ValueError("TRUSTED_HOSTS contains a development-only host")
+
+        self._validate_production_database(forbidden_hosts)
+        self._validate_production_redis(forbidden_hosts)
+        self._validate_production_ai_services()
+
+    def _validate_production_database(self, forbidden_hosts: set[str]) -> None:
+        database_url = make_url(self.database_url.get_secret_value())
+        if database_url.host in forbidden_hosts:
+            raise ValueError("DATABASE_URL cannot target a local host in production")
+        if database_url.password is None:
+            raise ValueError("DATABASE_URL must contain managed credentials in production")
+        if _looks_like_placeholder(database_url.password):
+            raise ValueError("DATABASE_URL must not use placeholder credentials in production")
+        database_tls = database_url.query.get("ssl")
+        if database_tls not in {"require", "verify-ca", "verify-full"}:
+            raise ValueError("DATABASE_URL must require TLS in production")
+
+    def _validate_production_redis(self, forbidden_hosts: set[str]) -> None:
+        redis_url = urlsplit(self.redis_url.get_secret_value())
+        railway_private = (
+            redis_url.scheme == "redis"
+            and _is_railway_private_host(redis_url.hostname)
+            and redis_url.port is not None
+        )
+        if redis_url.scheme != "rediss" and not railway_private:
+            raise ValueError("REDIS_URL must use TLS or Railway private networking in production")
+        if redis_url.hostname in forbidden_hosts or redis_url.password is None:
+            raise ValueError("REDIS_URL must contain managed remote credentials in production")
+        if _looks_like_placeholder(redis_url.password):
+            raise ValueError("REDIS_URL must not use placeholder credentials in production")
+
+    def _validate_production_ai_services(self) -> None:
+        embedding_url = urlsplit(str(self.embedding_service_url))
+        trusted_unencrypted = embedding_url.scheme == "http" and embedding_url.port is not None
+        railway_private = trusted_unencrypted and _is_railway_private_host(embedding_url.hostname)
+        same_host_loopback = trusted_unencrypted and _is_loopback_host(embedding_url.hostname)
+        if self.embedding_service_url.scheme != "https" and not (
+            railway_private or same_host_loopback
+        ):
+            raise ValueError(
+                "EMBEDDING_SERVICE_URL must use HTTPS, Railway private networking, or a loopback "
+                "address on a single-host deployment in production"
+            )
+        if self.qdrant_url.scheme != "https":
+            raise ValueError("QDRANT_URL must use HTTPS in production")
+        if len(self.qdrant_api_key.get_secret_value()) < MINIMUM_SECRET_LENGTH:
+            raise ValueError("QDRANT_API_KEY must contain a production credential")
+        if self.service_role is ServiceRole.WORKER:
+            return
+        if self.llm_provider is not LLMProvider.OPENAI:
+            raise ValueError("LLM_PROVIDER must be openai in production")
+        if self.llm_api_url.scheme != "https":
+            raise ValueError("LLM_API_URL must use HTTPS in production")
+        if _normalized_service_url(self.llm_api_url) not in SUPPORTED_LLM_API_BASE_URLS:
+            raise ValueError("LLM_API_URL must use an approved provider endpoint in production")
+        if len(self.llm_api_key.get_secret_value()) < MINIMUM_SECRET_LENGTH:
+            raise ValueError("LLM_API_KEY must contain a production credential")
+
+    def _validate_production_credentials(self) -> None:
+        credentials = {
+            "GITHUB_APP_PRIVATE_KEY": self.github_app_private_key.get_secret_value(),
+            "EMBEDDING_SERVICE_TOKEN": self.embedding_service_token.get_secret_value(),
+            "QDRANT_API_KEY": self.qdrant_api_key.get_secret_value(),
+        }
+        if self.service_role is ServiceRole.API:
+            credentials.update(
+                {
+                    "GITHUB_CLIENT_ID": self.github_client_id,
+                    "GITHUB_CLIENT_SECRET": self.github_client_secret.get_secret_value(),
+                    "GITHUB_WEBHOOK_SECRET": self.github_webhook_secret.get_secret_value(),
+                    "ACCESS_TOKEN_SECRET": self.access_token_secret.get_secret_value(),
+                    "TOKEN_HASH_SECRET": self.token_hash_secret.get_secret_value(),
+                    "LLM_API_KEY": self.llm_api_key.get_secret_value(),
+                }
+            )
+        if self.service_role is ServiceRole.API and self.google_auth_enabled:
+            credentials["GOOGLE_CLIENT_ID"] = self.google_client_id
+            credentials["GOOGLE_CLIENT_SECRET"] = self.google_client_secret.get_secret_value()
+        if self.github_public_api_token.get_secret_value():
+            credentials["GITHUB_PUBLIC_API_TOKEN"] = self.github_public_api_token.get_secret_value()
+        invalid = next(
+            (
+                name
+                for name, credential in credentials.items()
+                if _looks_like_placeholder(credential)
+            ),
+            None,
+        )
+        if invalid is not None:
+            raise ValueError(f"{invalid} must not use a placeholder value in production")
+
+    @staticmethod
+    def _validate_callback_url(value: AnyHttpUrl, expected_path: str) -> None:
+        parsed = urlsplit(str(value))
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or parsed.path.rstrip("/") != expected_path
+        ):
+            raise ValueError("OAuth callback URL must use the exact application callback path")
+
+    @model_validator(mode="after")
+    def validate_parser_limits(self) -> Self:
+        """Keep parsing and chunking bounds internally consistent."""
+        if self.parser_max_input_bytes > self.clone_max_file_bytes:
+            raise ValueError("PARSER_MAX_INPUT_BYTES cannot exceed CLONE_MAX_FILE_BYTES")
+        if self.parser_max_chunk_bytes > self.parser_max_symbol_bytes:
+            raise ValueError("PARSER_MAX_CHUNK_BYTES cannot exceed PARSER_MAX_SYMBOL_BYTES")
+        self._validate_call_graph_limits()
+        if self.parser_max_chunk_bytes > self.parser_max_document_section_bytes:
+            raise ValueError(
+                "PARSER_MAX_CHUNK_BYTES cannot exceed PARSER_MAX_DOCUMENT_SECTION_BYTES"
+            )
+        if self.parser_process_cpu_seconds > self.parser_timeout_seconds:
+            raise ValueError("PARSER_PROCESS_CPU_SECONDS cannot exceed PARSER_TIMEOUT_SECONDS")
+        if self.embedding_max_document_bytes < self.parser_max_chunk_bytes:
+            raise ValueError(
+                "EMBEDDING_MAX_DOCUMENT_BYTES cannot be smaller than PARSER_MAX_CHUNK_BYTES"
+            )
+        if self.rag_retrieval_overfetch < self.rag_retrieval_top_k:
+            raise ValueError("RAG_RETRIEVAL_OVERFETCH cannot be smaller than RAG_RETRIEVAL_TOP_K")
+        if self.rag_max_evidence_item_bytes > self.rag_max_evidence_bytes:
+            raise ValueError("RAG_MAX_EVIDENCE_ITEM_BYTES cannot exceed RAG_MAX_EVIDENCE_BYTES")
+        if self.llm_read_timeout_seconds >= self.rag_total_timeout_seconds:
+            raise ValueError("LLM_READ_TIMEOUT_SECONDS must be below RAG_TOTAL_TIMEOUT_SECONDS")
+        if self.agent_provider_timeout_seconds >= self.agent_total_timeout_seconds:
+            raise ValueError(
+                "AGENT_PROVIDER_TIMEOUT_SECONDS must be below AGENT_TOTAL_TIMEOUT_SECONDS"
+            )
+        if self.agent_max_tool_result_bytes > self.agent_max_total_evidence_bytes:
+            raise ValueError(
+                "AGENT_MAX_TOOL_RESULT_BYTES cannot exceed AGENT_MAX_TOTAL_EVIDENCE_BYTES"
+            )
+        if (
+            self.llm_provider is LLMProvider.DETERMINISTIC
+            and self.app_env is not AppEnvironment.TEST
+        ):
+            raise ValueError("The deterministic LLM provider is allowed only in test")
+        return self
+
+    def _validate_call_graph_limits(self) -> None:
+        if self.parser_max_call_sites_per_file > self.parser_max_total_call_sites:
+            raise ValueError(
+                "PARSER_MAX_CALL_SITES_PER_FILE cannot exceed PARSER_MAX_TOTAL_CALL_SITES"
+            )
+
+    @property
+    def is_production(self) -> bool:
+        """Return whether production safeguards are required."""
+        return self.app_env is AppEnvironment.PRODUCTION
+
+    def safe_summary(self) -> dict[str, Any]:
+        """Return the only configuration fields allowed in startup logs."""
+        return {
+            "app_env": self.app_env.value,
+            "service_role": self.service_role.value,
+            "log_level": self.log_level,
+            "log_json": self.log_json,
+            "docs_enabled": self.docs_enabled,
+            "cors_origin_count": len(self.cors_origins),
+            "trusted_host_count": len(self.trusted_hosts),
+            "access_token_ttl_seconds": self.access_token_ttl_seconds,
+            "membership_ttl_seconds": self.installation_membership_ttl_seconds,
+            "google_auth_enabled": self.google_auth_enabled,
+            "public_visibility_ttl_seconds": self.public_repository_visibility_ttl_seconds,
+            "public_repository_limit_per_user": self.public_repository_limit_per_user,
+            "worker_max_attempts": self.worker_max_attempts,
+            "clone_timeout_seconds": self.clone_timeout_seconds,
+            "parser_max_input_bytes": self.parser_max_input_bytes,
+            "parser_max_total_chunks": self.parser_max_total_chunks,
+            "parser_max_total_chunk_bytes": self.parser_max_total_chunk_bytes,
+            "parser_timeout_seconds": self.parser_timeout_seconds,
+            "embedding_model_identifier": self.embedding_model_identifier,
+            "embedding_model_revision": self.embedding_model_revision,
+            "embedding_dimension": self.embedding_dimension,
+            "embedding_batch_size": self.embedding_batch_size,
+            "qdrant_collection_name": self.qdrant_collection_name,
+            "rag_retrieval_top_k": self.rag_retrieval_top_k,
+            "rag_total_timeout_seconds": self.rag_total_timeout_seconds,
+            "llm_provider": self.llm_provider.value,
+            "llm_model": self.llm_model,
+            "llm_prompt_version": self.llm_prompt_version,
+            "agent_max_tool_calls": self.agent_max_tool_calls,
+            "agent_tool_timeout_seconds": self.agent_tool_timeout_seconds,
+            "agent_total_timeout_seconds": self.agent_total_timeout_seconds,
+            "question_rate_limit_enabled": self.question_rate_limit_enabled,
+            "question_rate_limit_per_minute": self.question_rate_limit_per_minute,
+            "question_rate_limit_per_day": self.question_rate_limit_per_day,
+        }
+
+
+def load_settings() -> Settings:
+    """Load settings without leaking rejected values through startup errors."""
+    try:
+        return Settings()
+    except ValidationError:
+        raise RuntimeError("Application configuration is invalid") from None
+
+
+class MigrationSettings(BaseSettings):
+    """Minimal release-command settings that never require application secrets."""
+
+    model_config = SettingsConfigDict(
+        env_file=(".env", "../.env"),
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+        validate_default=True,
+    )
+
+    app_env: AppEnvironment = AppEnvironment.DEVELOPMENT
+    database_url: SecretStr = Field(
+        validation_alias=AliasChoices("MIGRATION_DATABASE_URL", "DATABASE_URL")
+    )
+
+    @field_validator("database_url")
+    @classmethod
+    def validate_database_url(cls, value: SecretStr) -> SecretStr:
+        return _validated_database_url(value, variable_name="MIGRATION_DATABASE_URL")
+
+    @model_validator(mode="after")
+    def validate_production_database(self) -> Self:
+        if self.app_env is not AppEnvironment.PRODUCTION:
+            return self
+        parsed = make_url(self.database_url.get_secret_value())
+        if parsed.host in {"localhost", "127.0.0.1", "0.0.0.0"} or parsed.password is None:
+            raise ValueError("MIGRATION_DATABASE_URL must use managed remote credentials")
+        if _looks_like_placeholder(parsed.password):
+            raise ValueError("MIGRATION_DATABASE_URL must not use placeholder credentials")
+        if parsed.query.get("ssl") not in {"require", "verify-ca", "verify-full"}:
+            raise ValueError("MIGRATION_DATABASE_URL must require TLS in production")
+        return self
+
+
+def load_migration_database_url() -> str:
+    """Load only the release database URL and never expose a rejected value."""
+    try:
+        return MigrationSettings().database_url.get_secret_value()
+    except ValidationError:
+        raise RuntimeError("Migration configuration is invalid") from None

@@ -1,0 +1,141 @@
+name: repolume
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-repolume}
+      POSTGRES_USER: ${POSTGRES_USER:-repolume}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+
+  redis:
+    image: redis:8.8-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--protected-mode", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    read_only: true
+    tmpfs:
+      - /data:size=32m,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  qdrant:
+    image: qdrant/qdrant:v1.18.2
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c '</dev/tcp/127.0.0.1/6333'"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    security_opt:
+      - no-new-privileges:true
+
+  embedding-service:
+    build:
+      context: embedding_service
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8100:8100"
+    environment:
+      LLM_API_KEY: ""
+    read_only: true
+    # ONNX runtime writes scratch/arena files under sustained batch load, not just
+    # at startup; 64m was enough for the model to load but fills mid-batch and
+    # kills the process without a Python-level error to log.
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8100/health/live', timeout=25)"]
+      interval: 30s
+      timeout: 30s
+      retries: 20
+      start_period: 5s
+
+  api:
+    build:
+      context: backend
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      EMBEDDING_SERVICE_URL: http://embedding-service:8100
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  worker:
+    build:
+      context: backend
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      embedding-service:
+        condition: service_healthy
+    environment:
+      QDRANT_URL: http://qdrant:6333
+      EMBEDDING_SERVICE_URL: http://embedding-service:8100
+      LLM_API_KEY: ""
+    read_only: true
+    tmpfs:
+      - /tmp:size=600m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  postgres_data:
+  qdrant_data:

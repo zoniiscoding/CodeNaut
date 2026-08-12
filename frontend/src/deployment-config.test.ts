@@ -1,0 +1,34 @@
+import { describe, expect, it } from "vitest";
+import { createVercelConfig, validateProductionApiBaseUrl } from "../deployment-config";
+
+describe("production deployment configuration", () => {
+  it("binds browser connections and SPA routing to the exact production API", () => {
+    const configuration = createVercelConfig(
+      "https://codenaut.example/api/v1",
+      "https://api.codenaut.example/api/v1",
+    );
+    const csp = configuration.headers[0]?.headers.find(
+      (header) => header.key === "Content-Security-Policy",
+    );
+
+    expect(csp?.value).toContain("connect-src 'self' https://codenaut.example");
+    expect(csp?.value).toContain("frame-ancestors 'none'");
+    expect(configuration.rewrites).toEqual([
+      {
+        source: "/api/v1/:path*",
+        destination: "https://api.codenaut.example/api/v1/:path*",
+      },
+      { source: "/(.*)", destination: "/index" },
+    ]);
+  });
+
+  it.each([
+    undefined,
+    "http://api.codenaut.example/api/v1",
+    "https://user:password@api.codenaut.example/api/v1",
+    "https://api.codenaut.example/api/v1?forward=unsafe",
+    "https://api.codenaut.example/api/v10",
+  ])("rejects an unsafe production API base: %s", (value) => {
+    expect(() => validateProductionApiBaseUrl(value)).toThrow();
+  });
+});

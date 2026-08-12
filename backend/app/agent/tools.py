@@ -1,0 +1,418 @@
+"""Trusted, bounded tools available to the direct repository agent."""
+
+import hashlib
+import re
+import uuid
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+from typing import Protocol, cast
+
+from pydantic import ValidationError
+from sqlalchemy import or_, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import aliased
+
+from app.agent.models import (
+    AgentEvidence,
+    AgentToolName,
+    CallerEvidence,
+    CommitEvidence,
+    FindCallersArguments,
+    GetHistoryArguments,
+    PullRequestEvidence,
+    SearchCodeArguments,
+)
+from app.core.config import Settings
+from app.db.models.call_edge import CallEdge
+from app.db.models.enums import IndexBuildState, RepositoryAccessMode
+from app.db.models.repository import Repository
+from app.db.models.repository_index_build import RepositoryIndexBuild
+from app.db.models.symbol_definition import SymbolDefinition
+from app.db.session import Database
+from app.embeddings.client import EmbeddingProviderProtocol
+from app.embeddings.preprocessing import EmbeddingPreprocessor
+from app.github.client import GitHubAPIError, GitHubHistoryClientProtocol
+from app.github.schemas import GitHubHistoryBundle
+from app.rag.evidence import EvidenceSelector
+from app.services.installations import InstallationAccessError, InstallationService
+from app.vector.qdrant import (
+    VectorStoreProtocol,
+    embedding_model_fingerprint,
+    vector_scope_for_repository,
+)
+
+_WORD_PATTERN = re.compile(r"[A-Za-z0-9_./-]+")
+_COMMIT_SHA_PATTERN = re.compile(r"(?<![0-9a-f])([0-9a-f]{7,40})(?![0-9a-f])", re.I)
+_MINIMUM_HISTORY_TERM_LENGTH = 3
+
+
+class AgentToolError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveRepositoryContext:
+    user_id: uuid.UUID
+    repository: Repository
+    index_version: int
+    commit_sha: str
+    preprocessing_fingerprint: str
+    original_question: str
+
+
+class AgentToolProtocol(Protocol):
+    name: AgentToolName
+
+    async def execute(
+        self,
+        context: ActiveRepositoryContext,
+        arguments: Mapping[str, str],
+        *,
+        step: int,
+    ) -> tuple[AgentEvidence, ...]: ...
+
+
+class SearchCodeTool:
+    name = AgentToolName.SEARCH_CODE
+
+    def __init__(
+        self,
+        *,
+        embeddings: EmbeddingProviderProtocol,
+        vectors: VectorStoreProtocol,
+        settings: Settings,
+    ) -> None:
+        self._embeddings = embeddings
+        self._vectors = vectors
+        self._settings = settings
+        self._preprocessor = EmbeddingPreprocessor(settings)
+        self._selector = EvidenceSelector(settings)
+
+    async def execute(
+        self,
+        context: ActiveRepositoryContext,
+        arguments: Mapping[str, str],
+        *,
+        step: int,
+    ) -> tuple[AgentEvidence, ...]:
+        try:
+            parsed = SearchCodeArguments.model_validate(arguments)
+            query = cast(str, parsed.query)
+            prepared = self._preprocessor.prepare_query(query)
+            query_vector = await self._embeddings.embed_query(prepared)
+            hits = await self._vectors.search(
+                vector_scope_for_repository(context.repository, context.index_version),
+                query_vector=query_vector,
+                commit_sha=context.commit_sha,
+                model_fingerprint=embedding_model_fingerprint(
+                    self._settings, context.preprocessing_fingerprint
+                ),
+                preprocessing_fingerprint=context.preprocessing_fingerprint,
+                limit=self._settings.rag_retrieval_overfetch,
+                score_threshold=self._settings.rag_retrieval_score_threshold,
+            )
+        except (ValidationError, ValueError) as error:
+            raise AgentToolError("invalid_search_code_arguments") from error
+        selected = self._selector.select(hits)
+        return tuple(
+            replace(item, evidence_id=f"T{step}-C{position}")
+            for position, item in enumerate(selected, start=1)
+        )
+
+
+class GetHistoryTool:
+    name = AgentToolName.GET_HISTORY
+
+    def __init__(
+        self,
+        *,
+        installations: InstallationService,
+        github: GitHubHistoryClientProtocol,
+        settings: Settings,
+    ) -> None:
+        self._installations = installations
+        self._github = github
+        self._limit = settings.agent_history_commit_limit
+        self._message_bytes = settings.agent_history_max_message_bytes
+        self._patch_bytes = settings.agent_history_max_patch_bytes
+        self._max_paths = settings.agent_history_max_paths
+
+    async def execute(
+        self,
+        context: ActiveRepositoryContext,
+        arguments: Mapping[str, str],
+        *,
+        step: int,
+    ) -> tuple[AgentEvidence, ...]:
+        try:
+            GetHistoryArguments.model_validate(arguments)
+        except ValidationError as error:
+            raise AgentToolError("invalid_get_history_arguments") from error
+        try:
+            requested_sha = _COMMIT_SHA_PATTERN.search(context.original_question)
+            revision = requested_sha.group(1).casefold() if requested_sha else context.commit_sha
+            if context.repository.access_mode is RepositoryAccessMode.PUBLIC:
+                bundles = await self._github.get_public_repository_history(
+                    owner=context.repository.github_owner,
+                    repository=context.repository.github_name,
+                    revision=revision,
+                    limit=self._limit,
+                )
+            else:
+                installation_id = context.repository.installation_id
+                if installation_id is None:
+                    raise AgentToolError("github_history_unavailable")
+                installation = await self._installations.get_authorized_installation(
+                    user_id=context.user_id,
+                    installation_id=installation_id,
+                )
+                token = await self._github.create_repository_installation_token(
+                    installation.github_installation_id,
+                    repository_id=context.repository.github_repository_id,
+                )
+                bundles = await self._github.get_repository_history(
+                    token,
+                    owner=context.repository.github_owner,
+                    repository=context.repository.github_name,
+                    revision=revision,
+                    limit=self._limit,
+                )
+        except GitHubAPIError as error:
+            raise AgentToolError("github_history_unavailable") from error
+        ranked = self._rank(context.original_question, bundles)
+        result: list[AgentEvidence] = []
+        for position, bundle in enumerate(ranked, start=1):
+            commit = bundle.commit
+            files = tuple(item.filename for item in commit.files[: self._max_paths])
+            patches = "\n".join(item.patch or "" for item in commit.files if item.patch)
+            committed_at = (
+                commit.commit.committer.date
+                if commit.commit.committer is not None
+                else commit.commit.author.date
+                if commit.commit.author is not None
+                else None
+            )
+            if committed_at is None:
+                continue
+            result.append(
+                CommitEvidence(
+                    evidence_id=f"T{step}-H{position}",
+                    commit_sha=commit.sha,
+                    message=self._truncate(commit.commit.message, self._message_bytes),
+                    committed_at=committed_at,
+                    author_login=commit.author.login if commit.author else None,
+                    parent_shas=tuple(item.sha for item in commit.parents),
+                    changed_paths=files,
+                    patch_excerpt=self._truncate(patches, self._patch_bytes) if patches else None,
+                    html_url=commit.html_url,
+                )
+            )
+            for pull_position, pull in enumerate(bundle.pull_requests, start=1):
+                result.append(
+                    PullRequestEvidence(
+                        evidence_id=f"T{step}-P{position}-{pull_position}",
+                        number=pull.number,
+                        title=self._truncate(pull.title, self._message_bytes),
+                        state=pull.state,
+                        author_login=pull.user.login if pull.user else None,
+                        merged_at=pull.merged_at,
+                        merge_commit_sha=pull.merge_commit_sha,
+                        changed_paths=files,
+                        body_excerpt=(
+                            self._truncate(pull.body, self._message_bytes) if pull.body else None
+                        ),
+                        html_url=pull.html_url,
+                    )
+                )
+        return tuple(result)
+
+    @staticmethod
+    def _rank(query: str, bundles: Sequence[GitHubHistoryBundle]) -> Sequence[GitHubHistoryBundle]:
+        terms = {
+            item.casefold()
+            for item in _WORD_PATTERN.findall(query)
+            if len(item) >= _MINIMUM_HISTORY_TERM_LENGTH
+        }
+
+        def score(bundle: GitHubHistoryBundle) -> int:
+            commit = bundle.commit
+            haystack = " ".join(
+                (
+                    commit.commit.message,
+                    *(item.filename for item in commit.files),
+                    *(item.patch or "" for item in commit.files),
+                )
+            ).casefold()
+            return sum(term in haystack for term in terms)
+
+        return tuple(sorted(bundles, key=score, reverse=True))
+
+    @staticmethod
+    def _truncate(value: str, maximum_bytes: int) -> str:
+        encoded = value.encode("utf-8")
+        if len(encoded) <= maximum_bytes:
+            return value
+        return encoded[:maximum_bytes].decode("utf-8", errors="ignore")
+
+
+class FindCallersTool:
+    """Read validated caller evidence from the authorized active index only."""
+
+    name = AgentToolName.FIND_CALLERS
+
+    def __init__(
+        self,
+        *,
+        database: Database,
+        installations: InstallationService,
+        settings: Settings,
+    ) -> None:
+        self._database = database
+        self._installations = installations
+        self._limit = settings.agent_caller_result_limit
+
+    async def execute(
+        self,
+        context: ActiveRepositoryContext,
+        arguments: Mapping[str, str],
+        *,
+        step: int,
+    ) -> tuple[AgentEvidence, ...]:
+        try:
+            parsed = FindCallersArguments.model_validate(arguments)
+            symbol_name = cast(str, parsed.symbol_name)
+        except (ValidationError, ValueError) as error:
+            raise AgentToolError("invalid_find_callers_arguments") from error
+        try:
+            repository = await self._installations.get_authorized_repository(
+                user_id=context.user_id,
+                repository_id=context.repository.id,
+                require_fresh_public_visibility=True,
+            )
+        except InstallationAccessError as error:
+            raise AgentToolError("caller_scope_revoked") from error
+        if (
+            repository.id != context.repository.id
+            or repository.installation_id != context.repository.installation_id
+            or repository.index_version != context.index_version
+            or repository.last_indexed_commit_sha != context.commit_sha
+        ):
+            raise AgentToolError("caller_scope_changed")
+        try:
+            async with self._database.session() as session:
+                build = await session.scalar(
+                    select(RepositoryIndexBuild).where(
+                        RepositoryIndexBuild.repository_id == repository.id,
+                        RepositoryIndexBuild.index_version == context.index_version,
+                        RepositoryIndexBuild.commit_sha == context.commit_sha,
+                        RepositoryIndexBuild.state == IndexBuildState.ACTIVE,
+                        RepositoryIndexBuild.graph_validated.is_(True),
+                        RepositoryIndexBuild.graph_fingerprint.is_not(None),
+                    )
+                )
+                if build is None:
+                    raise AgentToolError("call_graph_unavailable")  # noqa: TRY301
+                target_query = select(SymbolDefinition).where(
+                    SymbolDefinition.repository_id == repository.id,
+                    SymbolDefinition.index_version == context.index_version,
+                    SymbolDefinition.commit_sha == context.commit_sha,
+                    or_(
+                        SymbolDefinition.symbol_name == symbol_name,
+                        SymbolDefinition.qualified_name == symbol_name,
+                    ),
+                )
+                if parsed.file_path is not None:
+                    target_query = target_query.where(
+                        SymbolDefinition.file_path == parsed.file_path
+                    )
+                targets = tuple(
+                    (
+                        await session.scalars(
+                            target_query.order_by(
+                                SymbolDefinition.file_path,
+                                SymbolDefinition.start_line,
+                                SymbolDefinition.qualified_name,
+                            ).limit(2)
+                        )
+                    ).all()
+                )
+                if not targets:
+                    return ()
+                if len(targets) != 1:
+                    raise AgentToolError("caller_target_ambiguous")  # noqa: TRY301
+                target = targets[0]
+                caller = aliased(SymbolDefinition)
+                rows = (
+                    await session.execute(
+                        select(CallEdge, caller)
+                        .join(
+                            caller,
+                            caller.id == CallEdge.caller_symbol_id,
+                        )
+                        .where(
+                            CallEdge.repository_id == repository.id,
+                            CallEdge.index_version == context.index_version,
+                            CallEdge.commit_sha == context.commit_sha,
+                            CallEdge.callee_symbol_id == target.id,
+                            caller.repository_id == repository.id,
+                            caller.index_version == context.index_version,
+                            caller.commit_sha == context.commit_sha,
+                        )
+                        .order_by(
+                            caller.file_path,
+                            CallEdge.call_line,
+                            CallEdge.call_end_line,
+                            caller.qualified_name,
+                            CallEdge.call_site_fingerprint,
+                        )
+                        .limit(self._limit)
+                    )
+                ).all()
+        except AgentToolError:
+            raise
+        except SQLAlchemyError as error:
+            raise AgentToolError("caller_query_unavailable") from error
+        return tuple(
+            CallerEvidence(
+                evidence_id=f"T{step}-G{position}",
+                target_symbol_name=target.symbol_name,
+                target_qualified_name=target.qualified_name,
+                target_file_path=target.file_path,
+                caller_symbol_name=caller_symbol.symbol_name,
+                caller_qualified_name=caller_symbol.qualified_name,
+                caller_file_path=caller_symbol.file_path,
+                caller_start_line=caller_symbol.start_line,
+                caller_end_line=caller_symbol.end_line,
+                call_line=edge.call_line,
+                call_end_line=edge.call_end_line,
+                call_expression=edge.call_expression,
+                resolution_type=edge.resolution_type.value,
+                confidence=edge.confidence.value,
+                commit_sha=edge.commit_sha,
+                index_version=context.index_version,
+            )
+            for position, (edge, caller_symbol) in enumerate(rows, start=1)
+        )
+
+
+class AgentToolRegistry:
+    """Immutable allowlist; there is no dynamic import, shell, or arbitrary network tool."""
+
+    def __init__(self, tools: Sequence[AgentToolProtocol]) -> None:
+        self._tools = {item.name: item for item in tools}
+        if set(self._tools) != set(AgentToolName):
+            raise ValueError("agent_tool_registry_mismatch")
+
+    def get(self, name: AgentToolName) -> AgentToolProtocol:
+        return self._tools[name]
+
+    @property
+    def names(self) -> tuple[AgentToolName, ...]:
+        return tuple(sorted(self._tools, key=str))
+
+
+def safe_argument_fingerprint(name: AgentToolName, arguments: Mapping[str, str]) -> str:
+    canonical = "\x1f".join((name.value, *(f"{key}={arguments[key]}" for key in sorted(arguments))))
+    return hashlib.sha256(canonical.encode()).hexdigest()[:16]

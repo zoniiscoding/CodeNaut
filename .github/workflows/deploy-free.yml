@@ -1,0 +1,329 @@
+name: Deploy free tier (Cloud Run + Vercel)
+
+# Zero-cost-eligible alternative to deploy-production.yml (Railway). Targets Google
+# Cloud Run's free tier for api/worker/embeddings and Vercel's free tier for the
+# frontend. See docs/DEPLOYMENT_FREE.md for the one-time account setup this
+# workflow assumes already exists (Artifact Registry repo, Workload Identity
+# Federation, Secret Manager values, Cloud Scheduler job).
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full main-branch commit SHA that already passed CI
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write # required for keyless Workload Identity Federation to GCP
+
+concurrency:
+  group: free-tier-deployment
+  cancel-in-progress: false
+
+env:
+  GAR_LOCATION: ${{ vars.GCP_REGION }}
+  PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+  REPOSITORY: codenaut
+
+jobs:
+  validate-release:
+    name: Require the current main commit and successful CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      EXPECTED_SHA: ${{ inputs.commit_sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Validate requested release SHA is well-formed
+        run: |
+          case "$EXPECTED_SHA" in
+            *[!0-9a-f]*|'') exit 1 ;;
+          esac
+          test "${#EXPECTED_SHA}" -eq 40
+
+      - name: Check out the requested immutable source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Require the current main commit and successful CI
+        run: |
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$EXPECTED_SHA"
+          test "$(gh run list --workflow ci.yml --commit "$EXPECTED_SHA" --status completed --json conclusion --jq 'map(select(.conclusion == "success")) | length')" -ge 1
+
+  migrate:
+    name: Run database migrations against Neon
+    needs: validate-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    steps:
+      - name: Check out the requested immutable source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install locked backend dependencies
+        working-directory: backend
+        run: pip install --no-cache-dir --require-hashes --requirement requirements.lock
+
+      - name: Apply pending migrations
+        working-directory: backend
+        env:
+          MIGRATION_DATABASE_URL: ${{ secrets.MIGRATION_DATABASE_URL }}
+        run: alembic -c alembic.ini upgrade head
+
+  build-images:
+    name: Build and push container images
+    needs: validate-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      backend-image: ${{ steps.tags.outputs.backend }}
+      embedding-image: ${{ steps.tags.outputs.embedding }}
+    steps:
+      - name: Check out the requested immutable source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Compute image tags
+        id: tags
+        run: |
+          echo "backend=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/backend:${{ inputs.commit_sha }}" >> "$GITHUB_OUTPUT"
+          echo "embedding=${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/embedding:${{ inputs.commit_sha }}" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker "${{ env.GAR_LOCATION }}-docker.pkg.dev" --quiet
+
+      - name: Build and push the backend image (serves both api and worker)
+        working-directory: backend
+        run: |
+          docker build -t "${{ steps.tags.outputs.backend }}" .
+          docker push "${{ steps.tags.outputs.backend }}"
+
+      - name: Build and push the embedding-service image
+        working-directory: embedding_service
+        run: |
+          docker build -t "${{ steps.tags.outputs.embedding }}" .
+          docker push "${{ steps.tags.outputs.embedding }}"
+
+  deploy-embedding:
+    name: Deploy embedding service to Cloud Run
+    needs: build-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    outputs:
+      url: ${{ steps.url.outputs.url }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy embedding-service revision
+        run: |
+          gcloud run deploy embedding-service \
+            --project "${{ env.PROJECT_ID }}" \
+            --region "${{ env.GAR_LOCATION }}" \
+            --image "${{ needs.build-images.outputs.embedding-image }}" \
+            --service-account="${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}" \
+            --allow-unauthenticated \
+            --port=8100 \
+            --min-instances=0 \
+            --max-instances=1 \
+            --concurrency=1 \
+            --cpu=2 \
+            --memory=8Gi \
+            --timeout=300 \
+            --set-env-vars="EMBEDDING_ENVIRONMENT=production,EMBEDDING_LOG_JSON=true,EMBEDDING_MODEL_THREADS=1,EMBEDDING_MAX_CONCURRENT_REQUESTS=1" \
+            --set-secrets="EMBEDDING_SERVICE_TOKEN=embedding-service-token:latest" \
+            --quiet
+
+      - name: Record the deployed URL
+        id: url
+        run: |
+          echo "url=$(gcloud run services describe embedding-service --project "${{ env.PROJECT_ID }}" --region "${{ env.GAR_LOCATION }}" --format='value(status.url)')" >> "$GITHUB_OUTPUT"
+
+  deploy-worker-job:
+    name: Deploy worker as a Cloud Run Job
+    needs: build-images
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy (or create) the worker job definition
+        run: |
+          if gcloud run jobs describe indexing-worker --project "${{ env.PROJECT_ID }}" --region "${{ env.GAR_LOCATION }}" >/dev/null 2>&1; then
+            ACTION=update
+          else
+            ACTION=create
+          fi
+          gcloud run jobs "$ACTION" indexing-worker \
+            --project "${{ env.PROJECT_ID }}" \
+            --region "${{ env.GAR_LOCATION }}" \
+            --image "${{ needs.build-images.outputs.backend-image }}" \
+            --service-account="${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}" \
+            --command="python" \
+            --args="-m,app.worker" \
+            --task-timeout=1800 \
+            --max-retries=0 \
+            --cpu=2 \
+            --memory=4Gi \
+            --set-env-vars="SERVICE_ROLE=worker,APP_ENV=production,LOG_JSON=true,DOCS_ENABLED=false,PARSER_TIMEOUT_SECONDS=600,EMBEDDING_READ_TIMEOUT_SECONDS=300" \
+            --set-secrets="DATABASE_URL=database-url:latest,REDIS_URL=redis-url:latest,QDRANT_URL=qdrant-url:latest,QDRANT_API_KEY=qdrant-api-key:latest,GITHUB_APP_ID=github-app-id:latest,GITHUB_APP_PRIVATE_KEY=github-app-private-key:latest,EMBEDDING_SERVICE_URL=embedding-service-url:latest,EMBEDDING_SERVICE_TOKEN=embedding-service-token:latest,ACCESS_TOKEN_SECRET=access-token-secret:latest,TOKEN_HASH_SECRET=token-hash-secret:latest" \
+            --quiet
+
+      - name: Ensure the Cloud Scheduler trigger exists
+        run: |
+          if ! gcloud scheduler jobs describe indexing-worker-trigger --project "${{ env.PROJECT_ID }}" --location "${{ env.GAR_LOCATION }}" >/dev/null 2>&1; then
+            gcloud scheduler jobs create http indexing-worker-trigger \
+              --project "${{ env.PROJECT_ID }}" \
+              --location "${{ env.GAR_LOCATION }}" \
+              --schedule="*/2 * * * *" \
+              --uri="https://${{ env.GAR_LOCATION }}-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/${{ env.PROJECT_ID }}/jobs/indexing-worker:run" \
+              --http-method=POST \
+              --oauth-service-account-email="${{ vars.GCP_SCHEDULER_SERVICE_ACCOUNT }}" \
+              --quiet
+          fi
+
+  deploy-api:
+    name: Deploy API to Cloud Run
+    needs: [build-images, migrate, deploy-embedding]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    outputs:
+      api-url: ${{ steps.url.outputs.url }}
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Write Cloud Run env vars file
+        run: |
+          cat > /tmp/api-env-vars.yaml <<EOF
+          SERVICE_ROLE: api
+          APP_ENV: production
+          LOG_JSON: "true"
+          DOCS_ENABLED: "false"
+          FRONTEND_URL: ${{ vars.PRODUCTION_FRONTEND_ORIGIN }}
+          CORS_ORIGINS: '["${{ vars.PRODUCTION_FRONTEND_ORIGIN }}"]'
+          TRUSTED_HOSTS: '["${{ vars.PRODUCTION_API_HOST }}"]'
+          GITHUB_OAUTH_CALLBACK_URL: ${{ vars.PRODUCTION_API_ORIGIN }}/api/v1/auth/github/callback
+          GOOGLE_AUTH_ENABLED: "true"
+          GOOGLE_OAUTH_CALLBACK_URL: ${{ vars.PRODUCTION_API_ORIGIN }}/api/v1/auth/google/callback
+          LLM_PROVIDER: openai
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          EOF
+
+      - name: Deploy api revision
+        run: |
+          gcloud run deploy api \
+            --project "${{ env.PROJECT_ID }}" \
+            --region "${{ env.GAR_LOCATION }}" \
+            --image "${{ needs.build-images.outputs.backend-image }}" \
+            --service-account="${{ vars.GCP_DEPLOY_SERVICE_ACCOUNT }}" \
+            --allow-unauthenticated \
+            --port=8000 \
+            --min-instances=0 \
+            --max-instances=2 \
+            --cpu=1 \
+            --memory=512Mi \
+            --timeout=60 \
+            --env-vars-file=/tmp/api-env-vars.yaml \
+            --set-secrets="DATABASE_URL=database-url:latest,REDIS_URL=redis-url:latest,QDRANT_URL=qdrant-url:latest,QDRANT_API_KEY=qdrant-api-key:latest,GITHUB_APP_ID=github-app-id:latest,GITHUB_APP_PRIVATE_KEY=github-app-private-key:latest,GITHUB_CLIENT_ID=github-client-id:latest,GITHUB_CLIENT_SECRET=github-client-secret:latest,GITHUB_WEBHOOK_SECRET=github-webhook-secret:latest,GOOGLE_CLIENT_ID=google-client-id:latest,GOOGLE_CLIENT_SECRET=google-client-secret:latest,ACCESS_TOKEN_SECRET=access-token-secret:latest,TOKEN_HASH_SECRET=token-hash-secret:latest,EMBEDDING_SERVICE_URL=embedding-service-url:latest,EMBEDDING_SERVICE_TOKEN=embedding-service-token:latest,LLM_API_URL=llm-api-url:latest,LLM_API_KEY=llm-api-key:latest" \
+            --quiet
+
+      - name: Record the deployed URL
+        id: url
+        run: |
+          echo "url=$(gcloud run services describe api --project "${{ env.PROJECT_ID }}" --region "${{ env.GAR_LOCATION }}" --format='value(status.url)')" >> "$GITHUB_OUTPUT"
+
+  deploy-frontend:
+    name: Build and deploy Vercel frontend
+    needs: deploy-api
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    env:
+      VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+      VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+      VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+      VITE_API_BASE_URL: ${{ vars.PRODUCTION_API_ORIGIN }}/api/v1
+      API_PROXY_TARGET: ${{ vars.PRODUCTION_API_ORIGIN }}/api/v1
+    steps:
+      - name: Check out the requested immutable source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Build immutable Vercel frontend
+        working-directory: frontend
+        run: |
+          npx --yes vercel@56.4.1 pull --yes --environment production --token "$VERCEL_TOKEN"
+          npx --yes vercel@56.4.1 build --prod --token "$VERCEL_TOKEN"
+
+      - name: Deploy prebuilt Vercel frontend
+        working-directory: frontend
+        run: npx --yes vercel@56.4.1 deploy --prebuilt --prod --token "$VERCEL_TOKEN"
+
+  smoke:
+    name: Verify public production boundaries
+    needs: [deploy-api, deploy-frontend]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: production
+    env:
+      PRODUCTION_API_ORIGIN: ${{ vars.PRODUCTION_API_ORIGIN }}
+      PRODUCTION_FRONTEND_ORIGIN: ${{ vars.PRODUCTION_FRONTEND_ORIGIN }}
+    steps:
+      - name: Check out the requested immutable source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ inputs.commit_sha }}
+          persist-credentials: false
+
+      - name: Run smoke checks
+        run: ./scripts/smoke-production.sh

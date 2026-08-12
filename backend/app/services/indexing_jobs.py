@@ -1,0 +1,1076 @@
+"""Atomic PostgreSQL state transitions for durable indexing workers."""
+
+import hashlib
+import secrets
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import delete, exists, or_, select, update
+from sqlalchemy.exc import IntegrityError
+
+from app.core.config import Settings
+from app.db.models.call_edge import CallEdge
+from app.db.models.enums import (
+    IndexBuildState,
+    IndexCleanupStatus,
+    IndexingJobStatus,
+    IndexingMode,
+    InstallationStatus,
+    RepositoryAccessMode,
+    RepositoryIndexingStatus,
+    ResolutionType,
+    WebhookDeliveryStatus,
+)
+from app.db.models.github_installation import GitHubInstallation, InstallationMember
+from app.db.models.indexing_job import IndexingJob
+from app.db.models.repository import Repository
+from app.db.models.repository_index_build import RepositoryIndexBuild
+from app.db.models.symbol_definition import SymbolDefinition
+from app.db.models.user_repository import UserRepository
+from app.db.models.webhook_delivery import WebhookDelivery
+from app.db.session import Database
+from app.indexing.call_graph import deterministic_symbol_id
+from app.indexing.discovery import DiscoveryResult
+from app.indexing.failures import IndexingError
+from app.indexing.models import ProcessingResult
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedJob:
+    id: uuid.UUID
+    repository_id: uuid.UUID
+    attempt: int
+
+
+@dataclass(frozen=True, slots=True)
+class JobContext:
+    job_id: uuid.UUID
+    repository_id: uuid.UUID
+    installation_id: uuid.UUID | None
+    github_installation_id: int | None
+    owner: str
+    name: str
+    default_branch: str
+    index_version: int
+    github_repository_id: int = 1
+    refresh_generation: int = 0
+    active_index_version: int = 0
+    active_commit_sha: str | None = None
+    indexed_branch: str | None = None
+    requested_mode: IndexingMode = IndexingMode.FULL
+    access_mode: RepositoryAccessMode = RepositoryAccessMode.GITHUB_INSTALLATION
+
+
+class IndexingJobStore:
+    """Keep transitions conditional so duplicate workers cannot share one job."""
+
+    def __init__(self, database: Database, settings: Settings) -> None:
+        self._database = database
+        self._membership_ttl = timedelta(seconds=settings.installation_membership_ttl_seconds)
+        self._abandoned_after = timedelta(seconds=settings.worker_abandoned_after_seconds)
+        self._max_attempts = settings.worker_max_attempts
+        self._retry_base = settings.worker_retry_base_seconds
+        self._retry_max = settings.worker_retry_max_seconds
+        self._embedding_model_identifier = settings.embedding_model_identifier
+        self._embedding_model_revision = settings.embedding_model_revision
+        self._embedding_dimension = settings.embedding_dimension
+
+    async def claim(self, job_id: uuid.UUID, worker_id: str) -> ClaimedJob | None:
+        now = datetime.now(UTC)
+        async with self._database.session() as session:
+            try:
+                result = await session.execute(
+                    update(IndexingJob)
+                    .where(
+                        IndexingJob.id == job_id,
+                        IndexingJob.status.in_(
+                            (IndexingJobStatus.QUEUED, IndexingJobStatus.RETRYING)
+                        ),
+                        or_(
+                            IndexingJob.next_attempt_at.is_(None),
+                            IndexingJob.next_attempt_at <= now,
+                        ),
+                    )
+                    .values(
+                        status=IndexingJobStatus.RUNNING,
+                        attempt=IndexingJob.attempt + 1,
+                        locked_by=worker_id,
+                        started_at=now,
+                        heartbeat_at=now,
+                        next_attempt_at=None,
+                        error_code=None,
+                        safe_error_message=None,
+                    )
+                    .returning(IndexingJob.id, IndexingJob.repository_id, IndexingJob.attempt)
+                )
+            except IntegrityError:
+                await session.rollback()
+                return None
+            row = result.one_or_none()
+            if row is None:
+                await session.rollback()
+                return None
+            await session.execute(
+                update(Repository)
+                .where(Repository.id == row.repository_id)
+                .values(
+                    indexing_status=RepositoryIndexingStatus.CLONING,
+                    indexing_progress=5,
+                    indexing_stage="cloning",
+                    indexing_error_code=None,
+                    indexing_error_message=None,
+                )
+            )
+            await session.execute(
+                update(WebhookDelivery)
+                .where(WebhookDelivery.indexing_job_id == row.id)
+                .values(status=WebhookDeliveryStatus.PROCESSING)
+            )
+            await session.commit()
+            return ClaimedJob(id=row.id, repository_id=row.repository_id, attempt=row.attempt)
+
+    async def authorized_context(self, claimed: ClaimedJob) -> JobContext | None:
+        cutoff = datetime.now(UTC) - self._membership_ttl
+        async with self._database.session() as session:
+            row = (
+                await session.execute(
+                    select(IndexingJob, Repository, GitHubInstallation)
+                    .join(Repository, Repository.id == IndexingJob.repository_id)
+                    .outerjoin(
+                        GitHubInstallation,
+                        GitHubInstallation.id == Repository.installation_id,
+                    )
+                    .where(
+                        IndexingJob.id == claimed.id,
+                        IndexingJob.status == IndexingJobStatus.RUNNING,
+                        Repository.access_revoked_at.is_(None),
+                        Repository.deleted_at.is_(None),
+                        or_(
+                            (
+                                (Repository.access_mode == RepositoryAccessMode.PUBLIC)
+                                & exists(
+                                    select(UserRepository.id).where(
+                                        UserRepository.repository_id == Repository.id,
+                                        or_(
+                                            IndexingJob.requested_by_user_id.is_(None),
+                                            UserRepository.user_id
+                                            == IndexingJob.requested_by_user_id,
+                                        ),
+                                    )
+                                )
+                            ),
+                            (
+                                (Repository.access_mode == RepositoryAccessMode.GITHUB_INSTALLATION)
+                                & (GitHubInstallation.status == InstallationStatus.ACTIVE)
+                                & GitHubInstallation.deleted_at.is_(None)
+                                & exists(
+                                    select(InstallationMember.id).where(
+                                        InstallationMember.installation_id == GitHubInstallation.id,
+                                        InstallationMember.verified_at >= cutoff,
+                                        or_(
+                                            IndexingJob.requested_by_user_id.is_(None),
+                                            InstallationMember.user_id
+                                            == IndexingJob.requested_by_user_id,
+                                        ),
+                                    )
+                                )
+                            ),
+                        ),
+                    )
+                    .with_for_update(of=IndexingJob)
+                )
+            ).one_or_none()
+            if row is None:
+                await session.rollback()
+                return None
+            job, repository, installation = row
+            if job.target_index_version is None:
+                job.target_index_version = repository.index_version + 1
+            context = JobContext(
+                job_id=claimed.id,
+                repository_id=repository.id,
+                installation_id=None if installation is None else installation.id,
+                github_installation_id=(
+                    None if installation is None else installation.github_installation_id
+                ),
+                github_repository_id=repository.github_repository_id,
+                owner=repository.github_owner,
+                name=repository.github_name,
+                default_branch=repository.default_branch,
+                index_version=job.target_index_version,
+                refresh_generation=job.refresh_generation,
+                active_index_version=repository.index_version,
+                active_commit_sha=repository.last_indexed_commit_sha,
+                indexed_branch=repository.indexed_branch,
+                requested_mode=job.requested_mode or IndexingMode.FULL,
+                access_mode=repository.access_mode,
+            )
+            await session.commit()
+            return context
+
+    async def revoke_public_access(self, repository_id: uuid.UUID) -> None:
+        async with self._database.session() as session:
+            await session.execute(
+                update(Repository)
+                .where(
+                    Repository.id == repository_id,
+                    Repository.access_mode == RepositoryAccessMode.PUBLIC,
+                )
+                .values(
+                    access_revoked_at=datetime.now(UTC),
+                    indexing_status=RepositoryIndexingStatus.ACCESS_REVOKED,
+                    indexing_stage="public_access_unavailable",
+                )
+            )
+            await session.commit()
+
+    async def heartbeat(self, claimed: ClaimedJob, worker_id: str) -> None:
+        async with self._database.session() as session:
+            await session.execute(
+                update(IndexingJob)
+                .where(
+                    IndexingJob.id == claimed.id,
+                    IndexingJob.status == IndexingJobStatus.RUNNING,
+                    IndexingJob.locked_by == worker_id,
+                )
+                .values(heartbeat_at=datetime.now(UTC))
+            )
+            await session.commit()
+
+    async def is_current(self, claimed: ClaimedJob, worker_id: str) -> bool:
+        """Check the repository generation before external or activation work."""
+        async with self._database.session() as session:
+            current = await session.scalar(
+                select(IndexingJob.id)
+                .join(Repository, Repository.id == IndexingJob.repository_id)
+                .where(
+                    IndexingJob.id == claimed.id,
+                    IndexingJob.status == IndexingJobStatus.RUNNING,
+                    IndexingJob.locked_by == worker_id,
+                    IndexingJob.refresh_generation == Repository.refresh_generation,
+                    or_(
+                        IndexingJob.target_branch.is_(None),
+                        IndexingJob.target_branch == Repository.default_branch,
+                    ),
+                )
+            )
+            return current is not None
+
+    async def mark_stale(
+        self,
+        claimed: ClaimedJob,
+        worker_id: str,
+        *,
+        code: str,
+        superseded: bool = False,
+    ) -> None:
+        now = datetime.now(UTC)
+        async with self._database.session() as session:
+            job = await session.scalar(
+                select(IndexingJob)
+                .where(
+                    IndexingJob.id == claimed.id,
+                    IndexingJob.status == IndexingJobStatus.RUNNING,
+                    IndexingJob.locked_by == worker_id,
+                )
+                .with_for_update()
+            )
+            if job is None:
+                return
+            job.status = IndexingJobStatus.CANCELLED
+            job.stage = "superseded" if superseded else "stale"
+            job.error_code = code
+            job.safe_error_message = "A newer repository state superseded this refresh"
+            job.completed_at = now
+            job.heartbeat_at = now
+            job.locked_by = None
+            delivery = await session.scalar(
+                select(WebhookDelivery).where(WebhookDelivery.indexing_job_id == job.id)
+            )
+            if delivery is not None:
+                delivery.status = (
+                    WebhookDeliveryStatus.SUPERSEDED if superseded else WebhookDeliveryStatus.STALE
+                )
+                delivery.safe_error_code = code
+                delivery.processed_at = now
+            await session.commit()
+
+    async def record_freshness_plan(
+        self,
+        claimed: ClaimedJob,
+        worker_id: str,
+        *,
+        actual_mode: IndexingMode,
+        fallback_reason: str | None,
+        changed_counts: dict[str, int],
+        changed_file_count: int,
+    ) -> None:
+        async with self._database.session() as session:
+            await session.execute(
+                update(IndexingJob)
+                .where(
+                    IndexingJob.id == claimed.id,
+                    IndexingJob.status == IndexingJobStatus.RUNNING,
+                    IndexingJob.locked_by == worker_id,
+                )
+                .values(
+                    actual_mode=actual_mode,
+                    full_rebuild_reason=fallback_reason,
+                    changed_files_json=changed_counts,
+                    changed_file_count=changed_file_count,
+                    graph_rebuilt=True,
+                )
+            )
+            await session.commit()
+
+    async def stage(
+        self,
+        claimed: ClaimedJob,
+        worker_id: str,
+        *,
+        status: RepositoryIndexingStatus,
+        stage: str,
+        progress: int,
+        commit_sha: str | None = None,
+    ) -> None:
+        now = datetime.now(UTC)
+        async with self._database.session() as session:
+            result = await session.execute(
+                update(IndexingJob)
+                .where(
+                    IndexingJob.id == claimed.id,
+                    IndexingJob.status == IndexingJobStatus.RUNNING,
+                    IndexingJob.locked_by == worker_id,
+                )
+                .values(
+                    stage=stage,
+                    progress=progress,
+                    heartbeat_at=now,
+                    source_commit_sha=commit_sha
+                    if commit_sha is not None
+                    else IndexingJob.source_commit_sha,
+                )
+                .returning(IndexingJob.repository_id)
+            )
+            repository_id = result.scalar_one_or_none()
+            if repository_id is not None:
+                values: dict[str, object] = {
+                    "indexing_status": status,
+                    "indexing_stage": stage,
+                    "indexing_progress": progress,
+                }
+                if commit_sha is not None:
+                    values["current_remote_sha"] = commit_sha
+                await session.execute(
+                    update(Repository).where(Repository.id == repository_id).values(**values)
+                )
+            await session.commit()
+
+    async def prepare_build(  # noqa: PLR0915 -- one atomic persistence transaction
+        self,
+        claimed: ClaimedJob,
+        worker_id: str,
+        *,
+        commit_sha: str,
+        discovery: DiscoveryResult,
+        processing: ProcessingResult,
+        preprocessing_fingerprint: str,
+    ) -> None:
+        if (
+            processing.repository_id != claimed.repository_id
+            or processing.commit_sha != commit_sha
+            or processing.index_version < 1
+        ):
+            raise RuntimeError("processing_result_mismatch")
+        async with self._database.session() as session:
+            row = (
+                await session.execute(
+                    select(IndexingJob, Repository)
+                    .join(Repository, Repository.id == IndexingJob.repository_id)
+                    .where(
+                        IndexingJob.id == claimed.id,
+                        IndexingJob.status == IndexingJobStatus.RUNNING,
+                        IndexingJob.locked_by == worker_id,
+                    )
+                    .with_for_update(of=(IndexingJob, Repository))
+                )
+            ).one_or_none()
+            if row is None:
+                raise self._activation_race()
+            job, repository = row
+            if (
+                job.target_index_version != processing.index_version
+                or processing.index_version != repository.index_version + 1
+            ):
+                raise self._activation_race()
+            build = await session.scalar(
+                select(RepositoryIndexBuild)
+                .where(
+                    RepositoryIndexBuild.repository_id == repository.id,
+                    RepositoryIndexBuild.index_version == processing.index_version,
+                )
+                .with_for_update()
+            )
+            if build is not None and build.job_id not in {None, claimed.id}:
+                raise self._activation_race()
+            if build is None:
+                build = RepositoryIndexBuild(
+                    repository_id=repository.id,
+                    job_id=claimed.id,
+                    index_version=processing.index_version,
+                    state=IndexBuildState.BUILDING,
+                    cleanup_status=IndexCleanupStatus.PENDING,
+                    commit_sha=commit_sha,
+                    embedding_model_identifier=self._embedding_model_identifier,
+                    embedding_model_revision=self._embedding_model_revision,
+                    embedding_dimension=self._embedding_dimension,
+                    preprocessing_fingerprint=preprocessing_fingerprint,
+                    expected_chunk_count=processing.chunk_count,
+                    call_site_count=processing.call_site_count,
+                    exact_edge_count=processing.exact_edge_count,
+                    ambiguous_edge_count=processing.ambiguous_edge_count,
+                    unresolved_call_count=processing.unresolved_call_count,
+                    graph_warning_count=processing.graph_warning_count,
+                    graph_fingerprint=processing.graph_fingerprint,
+                    graph_validated=False,
+                )
+                session.add(build)
+            else:
+                build.job_id = claimed.id
+                build.state = IndexBuildState.BUILDING
+                build.cleanup_status = IndexCleanupStatus.PENDING
+                build.commit_sha = commit_sha
+                build.embedding_model_identifier = self._embedding_model_identifier
+                build.embedding_model_revision = self._embedding_model_revision
+                build.embedding_dimension = self._embedding_dimension
+                build.preprocessing_fingerprint = preprocessing_fingerprint
+                build.expected_chunk_count = processing.chunk_count
+                build.embedded_chunk_count = 0
+                build.vector_count = 0
+                build.failed_chunk_count = 0
+                build.skipped_chunk_count = 0
+                build.call_site_count = processing.call_site_count
+                build.exact_edge_count = processing.exact_edge_count
+                build.ambiguous_edge_count = processing.ambiguous_edge_count
+                build.unresolved_call_count = processing.unresolved_call_count
+                build.graph_warning_count = processing.graph_warning_count
+                build.graph_fingerprint = processing.graph_fingerprint
+                build.graph_validated = False
+                build.activated_at = None
+                build.cleanup_completed_at = None
+            await session.execute(
+                delete(SymbolDefinition).where(
+                    SymbolDefinition.repository_id == repository.id,
+                    SymbolDefinition.index_version == processing.index_version,
+                )
+            )
+            session.add_all(
+                SymbolDefinition(
+                    id=deterministic_symbol_id(repository.id, processing.index_version, symbol),
+                    repository_id=repository.id,
+                    index_version=processing.index_version,
+                    file_path=symbol.file_path,
+                    language=symbol.language,
+                    symbol_name=symbol.symbol_name,
+                    qualified_name=symbol.qualified_name,
+                    symbol_type=symbol.symbol_type,
+                    start_line=symbol.start_line,
+                    end_line=symbol.end_line,
+                    content_hash=symbol.content_hash,
+                    commit_sha=symbol.commit_sha,
+                )
+                for symbol in processing.symbols
+            )
+            await session.flush()
+            session.add_all(
+                CallEdge(
+                    id=edge.id,
+                    repository_id=repository.id,
+                    index_version=processing.index_version,
+                    caller_symbol_id=edge.caller_symbol_id,
+                    callee_symbol_id=edge.callee_symbol_id,
+                    unresolved_callee_name=edge.unresolved_callee_name,
+                    file_path=edge.file_path,
+                    call_line=edge.call_line,
+                    call_end_line=edge.call_end_line,
+                    call_expression=edge.call_expression,
+                    call_site_fingerprint=edge.call_site_fingerprint,
+                    resolution_type=edge.resolution_type,
+                    confidence=edge.confidence,
+                    commit_sha=edge.commit_sha,
+                )
+                for edge in processing.call_edges
+            )
+            job.source_commit_sha = commit_sha
+            job.discovered_file_count = len(discovery.files)
+            job.discovered_total_bytes = discovery.total_bytes
+            job.skipped_files_json = discovery.skipped
+            job.parsed_file_count = processing.parsed_file_count
+            job.partial_file_count = processing.partial_file_count
+            job.parser_skipped_file_count = processing.skipped_file_count
+            job.symbol_count = processing.symbol_count
+            job.chunk_count = processing.chunk_count
+            job.parser_warnings_json = processing.warning_counts
+            job.embedding_model_identifier = self._embedding_model_identifier
+            job.embedding_model_revision = self._embedding_model_revision
+            job.embedding_dimension = self._embedding_dimension
+            job.preprocessing_fingerprint = preprocessing_fingerprint
+            job.call_site_count = processing.call_site_count
+            job.exact_edge_count = processing.exact_edge_count
+            job.ambiguous_edge_count = processing.ambiguous_edge_count
+            job.unresolved_call_count = processing.unresolved_call_count
+            job.graph_warning_count = processing.graph_warning_count
+            repository.current_remote_sha = commit_sha
+            repository.size_bytes = discovery.total_bytes
+            await session.commit()
+
+    async def validate_graph(self, claimed: ClaimedJob, worker_id: str) -> None:
+        """Validate persisted graph counts before an inactive build can become ready."""
+        async with self._database.session() as session:
+            job = await session.scalar(
+                select(IndexingJob).where(
+                    IndexingJob.id == claimed.id,
+                    IndexingJob.status == IndexingJobStatus.RUNNING,
+                    IndexingJob.locked_by == worker_id,
+                )
+            )
+            if job is None or job.target_index_version is None:
+                raise self._activation_race()
+            build = await session.scalar(
+                select(RepositoryIndexBuild)
+                .where(
+                    RepositoryIndexBuild.repository_id == claimed.repository_id,
+                    RepositoryIndexBuild.index_version == job.target_index_version,
+                    RepositoryIndexBuild.job_id == claimed.id,
+                    RepositoryIndexBuild.state == IndexBuildState.BUILDING,
+                )
+                .with_for_update()
+            )
+            if build is None or not build.graph_fingerprint:
+                raise self._graph_validation_error()
+            edges = tuple(
+                (
+                    await session.scalars(
+                        select(CallEdge)
+                        .where(
+                            CallEdge.repository_id == claimed.repository_id,
+                            CallEdge.index_version == job.target_index_version,
+                            CallEdge.commit_sha == build.commit_sha,
+                        )
+                        .order_by(
+                            CallEdge.file_path,
+                            CallEdge.call_line,
+                            CallEdge.call_end_line,
+                            CallEdge.caller_symbol_id,
+                            CallEdge.call_expression,
+                            # Must mirror the tiebreaker in PythonCallGraphBuilder's
+                            # in-memory sort, or ties there and here can land in
+                            # different relative order and the recomputed
+                            # fingerprint will disagree with the one already
+                            # stored, failing validation nondeterministically.
+                            CallEdge.call_site_fingerprint,
+                        )
+                    )
+                ).all()
+            )
+            exact = sum(
+                edge.callee_symbol_id is not None
+                and edge.resolution_type is not ResolutionType.PROBABLE_METHOD
+                for edge in edges
+            )
+            ambiguous = sum(edge.resolution_type is ResolutionType.AMBIGUOUS for edge in edges)
+            unresolved = sum(edge.resolution_type is ResolutionType.UNRESOLVED for edge in edges)
+            fingerprint = hashlib.sha256(
+                "\n".join(
+                    "\x1f".join(
+                        (
+                            str(edge.id),
+                            str(edge.caller_symbol_id),
+                            str(edge.callee_symbol_id or ""),
+                            edge.call_site_fingerprint,
+                            edge.resolution_type.value,
+                            edge.confidence.value,
+                        )
+                    )
+                    for edge in edges
+                ).encode()
+            ).hexdigest()
+            if (
+                len(edges) != build.call_site_count
+                or exact != build.exact_edge_count
+                or ambiguous != build.ambiguous_edge_count
+                or unresolved != build.unresolved_call_count
+                or fingerprint != build.graph_fingerprint
+            ):
+                raise self._graph_validation_error()
+            build.graph_validated = True
+            await session.commit()
+
+    async def record_vector_counts(
+        self,
+        claimed: ClaimedJob,
+        worker_id: str,
+        *,
+        embedded_chunk_count: int,
+        vector_count: int,
+        reused_chunk_count: int = 0,
+        reembedded_chunk_count: int | None = None,
+    ) -> None:
+        async with self._database.session() as session:
+            job = await session.scalar(
+                select(IndexingJob)
+                .where(
+                    IndexingJob.id == claimed.id,
+                    IndexingJob.status == IndexingJobStatus.RUNNING,
+                    IndexingJob.locked_by == worker_id,
+                )
+                .with_for_update()
+            )
+            if job is None or job.target_index_version is None:
+                raise self._activation_race()
+            build = await session.scalar(
+                select(RepositoryIndexBuild)
+                .where(
+                    RepositoryIndexBuild.repository_id == claimed.repository_id,
+                    RepositoryIndexBuild.index_version == job.target_index_version,
+                    RepositoryIndexBuild.job_id == claimed.id,
+                    RepositoryIndexBuild.state == IndexBuildState.BUILDING,
+                )
+                .with_for_update()
+            )
+            if build is None:
+                raise self._activation_race()
+            job.embedded_chunk_count = embedded_chunk_count
+            job.vector_count = vector_count
+            job.reused_chunk_count = reused_chunk_count
+            job.reembedded_chunk_count = (
+                embedded_chunk_count if reembedded_chunk_count is None else reembedded_chunk_count
+            )
+            build.embedded_chunk_count = embedded_chunk_count
+            build.vector_count = vector_count
+            await session.commit()
+
+    async def mark_build_ready(self, claimed: ClaimedJob, worker_id: str) -> None:
+        async with self._database.session() as session:
+            job = await session.scalar(
+                select(IndexingJob).where(
+                    IndexingJob.id == claimed.id,
+                    IndexingJob.status == IndexingJobStatus.RUNNING,
+                    IndexingJob.locked_by == worker_id,
+                )
+            )
+            if job is None or job.target_index_version is None:
+                raise self._activation_race()
+            result = await session.execute(
+                update(RepositoryIndexBuild)
+                .where(
+                    RepositoryIndexBuild.repository_id == claimed.repository_id,
+                    RepositoryIndexBuild.index_version == job.target_index_version,
+                    RepositoryIndexBuild.job_id == claimed.id,
+                    RepositoryIndexBuild.state == IndexBuildState.BUILDING,
+                    RepositoryIndexBuild.expected_chunk_count
+                    == RepositoryIndexBuild.embedded_chunk_count,
+                    RepositoryIndexBuild.expected_chunk_count == RepositoryIndexBuild.vector_count,
+                    RepositoryIndexBuild.graph_validated.is_(True),
+                    RepositoryIndexBuild.graph_fingerprint.is_not(None),
+                )
+                .values(state=IndexBuildState.READY)
+                .returning(RepositoryIndexBuild.id)
+            )
+            if result.scalar_one_or_none() is None:
+                raise IndexingError(
+                    code="vector_count_mismatch",
+                    message="The inactive vector index failed count validation",
+                    retryable=False,
+                )
+            await session.commit()
+
+    async def activate(
+        self,
+        claimed: ClaimedJob,
+        worker_id: str,
+        *,
+        commit_sha: str,
+    ) -> int:
+        now = datetime.now(UTC)
+        async with self._database.session() as session:
+            row = (
+                await session.execute(
+                    select(IndexingJob, Repository)
+                    .join(Repository, Repository.id == IndexingJob.repository_id)
+                    .where(
+                        IndexingJob.id == claimed.id,
+                        IndexingJob.status == IndexingJobStatus.RUNNING,
+                        IndexingJob.locked_by == worker_id,
+                    )
+                    .with_for_update(of=(IndexingJob, Repository))
+                )
+            ).one_or_none()
+            if row is None:
+                raise self._activation_race()
+            job, repository = row
+            target = job.target_index_version
+            if (
+                target is None
+                or repository.index_version + 1 != target
+                or job.refresh_generation != repository.refresh_generation
+                or (
+                    job.target_branch is not None and job.target_branch != repository.default_branch
+                )
+            ):
+                raise self._activation_race()
+            build = await session.scalar(
+                select(RepositoryIndexBuild)
+                .where(
+                    RepositoryIndexBuild.repository_id == repository.id,
+                    RepositoryIndexBuild.index_version == target,
+                    RepositoryIndexBuild.job_id == claimed.id,
+                    RepositoryIndexBuild.state == IndexBuildState.READY,
+                    RepositoryIndexBuild.commit_sha == commit_sha,
+                    RepositoryIndexBuild.expected_chunk_count
+                    == RepositoryIndexBuild.embedded_chunk_count,
+                    RepositoryIndexBuild.expected_chunk_count == RepositoryIndexBuild.vector_count,
+                    RepositoryIndexBuild.graph_validated.is_(True),
+                    RepositoryIndexBuild.graph_fingerprint.is_not(None),
+                )
+                .with_for_update()
+            )
+            if build is None:
+                raise self._activation_race()
+            previous_version = repository.index_version
+            if previous_version > 0:
+                previous = await session.scalar(
+                    select(RepositoryIndexBuild)
+                    .where(
+                        RepositoryIndexBuild.repository_id == repository.id,
+                        RepositoryIndexBuild.index_version == previous_version,
+                        RepositoryIndexBuild.state == IndexBuildState.ACTIVE,
+                    )
+                    .with_for_update()
+                )
+                if previous is None and repository.active_vector_count != 0:
+                    raise self._activation_race()
+                if previous is not None:
+                    previous.state = IndexBuildState.SUPERSEDED
+                    previous.cleanup_status = IndexCleanupStatus.PENDING
+                    # Keep the partial one-active-build invariant valid throughout
+                    # the flush while preserving transaction-level atomicity.
+                    await session.flush()
+            build.state = IndexBuildState.ACTIVE
+            build.cleanup_status = IndexCleanupStatus.NOT_REQUIRED
+            build.activated_at = now
+            repository.index_version = target
+            repository.last_indexed_commit_sha = commit_sha
+            repository.current_remote_sha = commit_sha
+            repository.indexed_branch = repository.default_branch
+            repository.last_indexed_at = now
+            repository.active_vector_count = build.vector_count
+            repository.indexing_status = RepositoryIndexingStatus.COMPLETE
+            repository.indexing_progress = 100
+            repository.indexing_stage = "complete"
+            repository.indexing_error_code = None
+            repository.indexing_error_message = None
+            job.status = IndexingJobStatus.COMPLETE
+            job.progress = 100
+            job.stage = "complete"
+            job.target_commit_sha = commit_sha
+            job.heartbeat_at = now
+            job.completed_at = now
+            job.locked_by = None
+            delivery = await session.scalar(
+                select(WebhookDelivery).where(WebhookDelivery.indexing_job_id == job.id)
+            )
+            if delivery is not None:
+                delivery.status = WebhookDeliveryStatus.COMPLETED
+                delivery.safe_error_code = None
+                delivery.processed_at = now
+                repository.last_delivery_status = WebhookDeliveryStatus.COMPLETED.value
+                repository.last_delivery_at = now
+            await session.commit()
+            return int(previous_version)
+
+    async def can_cleanup_inactive(self, repository_id: uuid.UUID, index_version: int) -> bool:
+        async with self._database.session() as session:
+            repository = await session.get(Repository, repository_id)
+            return repository is not None and repository.index_version != index_version
+
+    async def record_failed_build_cleanup(
+        self,
+        repository_id: uuid.UUID,
+        index_version: int,
+        *,
+        cleanup_complete: bool,
+    ) -> None:
+        now = datetime.now(UTC)
+        async with self._database.session() as session:
+            build = await session.scalar(
+                select(RepositoryIndexBuild)
+                .where(
+                    RepositoryIndexBuild.repository_id == repository_id,
+                    RepositoryIndexBuild.index_version == index_version,
+                    RepositoryIndexBuild.state != IndexBuildState.ACTIVE,
+                )
+                .with_for_update()
+            )
+            if build is not None:
+                build.state = IndexBuildState.FAILED
+                build.cleanup_status = (
+                    IndexCleanupStatus.COMPLETE if cleanup_complete else IndexCleanupStatus.PENDING
+                )
+                build.cleanup_completed_at = now if cleanup_complete else None
+                if cleanup_complete:
+                    await session.execute(
+                        delete(SymbolDefinition).where(
+                            SymbolDefinition.repository_id == repository_id,
+                            SymbolDefinition.index_version == index_version,
+                        )
+                    )
+            await session.commit()
+
+    async def complete_superseded_cleanup(
+        self, repository_id: uuid.UUID, index_version: int
+    ) -> None:
+        now = datetime.now(UTC)
+        async with self._database.session() as session:
+            repository = await session.get(Repository, repository_id, with_for_update=True)
+            if repository is None or repository.index_version == index_version:
+                raise self._activation_race()
+            build = await session.scalar(
+                select(RepositoryIndexBuild)
+                .where(
+                    RepositoryIndexBuild.repository_id == repository_id,
+                    RepositoryIndexBuild.index_version == index_version,
+                    RepositoryIndexBuild.state.in_(
+                        (IndexBuildState.SUPERSEDED, IndexBuildState.FAILED)
+                    ),
+                )
+                .with_for_update()
+            )
+            if build is not None:
+                build.cleanup_status = IndexCleanupStatus.COMPLETE
+                build.cleanup_completed_at = now
+            await session.execute(
+                delete(SymbolDefinition).where(
+                    SymbolDefinition.repository_id == repository_id,
+                    SymbolDefinition.index_version == index_version,
+                )
+            )
+            await session.commit()
+
+    async def cancel_revoked(self, claimed: ClaimedJob, worker_id: str) -> None:
+        now = datetime.now(UTC)
+        async with self._database.session() as session:
+            result = await session.execute(
+                update(IndexingJob)
+                .where(
+                    IndexingJob.id == claimed.id,
+                    IndexingJob.status == IndexingJobStatus.RUNNING,
+                    IndexingJob.locked_by == worker_id,
+                )
+                .values(
+                    status=IndexingJobStatus.CANCELLED,
+                    error_code="repository_access_revoked",
+                    safe_error_message="Repository access is no longer authorized",
+                    completed_at=now,
+                    heartbeat_at=now,
+                    locked_by=None,
+                )
+                .returning(IndexingJob.repository_id)
+            )
+            repository_id = result.scalar_one_or_none()
+            if repository_id is not None:
+                await session.execute(
+                    update(Repository)
+                    .where(Repository.id == repository_id)
+                    .values(
+                        indexing_status=RepositoryIndexingStatus.ACCESS_REVOKED,
+                        indexing_error_code="repository_access_revoked",
+                        indexing_error_message="Repository access is no longer authorized",
+                    )
+                )
+                delivery = await session.scalar(
+                    select(WebhookDelivery).where(WebhookDelivery.indexing_job_id == claimed.id)
+                )
+                if delivery is not None:
+                    delivery.status = WebhookDeliveryStatus.UNAUTHORIZED
+                    delivery.safe_error_code = "repository_access_revoked"
+                    delivery.processed_at = now
+            await session.commit()
+
+    async def fail(
+        self,
+        claimed: ClaimedJob,
+        worker_id: str,
+        *,
+        code: str,
+        safe_message: str,
+        retryable: bool,
+    ) -> bool:
+        now = datetime.now(UTC)
+        should_retry = retryable and claimed.attempt < self._max_attempts
+        status = IndexingJobStatus.RETRYING if should_retry else IndexingJobStatus.FAILED
+        next_attempt = now + self._retry_delay(claimed.attempt) if should_retry else None
+        async with self._database.session() as session:
+            result = await session.execute(
+                update(IndexingJob)
+                .where(
+                    IndexingJob.id == claimed.id,
+                    IndexingJob.status == IndexingJobStatus.RUNNING,
+                    IndexingJob.locked_by == worker_id,
+                )
+                .values(
+                    status=status,
+                    error_code=code,
+                    safe_error_message=safe_message,
+                    next_attempt_at=next_attempt,
+                    completed_at=None if should_retry else now,
+                    heartbeat_at=now,
+                    locked_by=None,
+                    stage="retry_wait" if should_retry else "failed",
+                )
+                .returning(IndexingJob.repository_id)
+            )
+            repository_id = result.scalar_one_or_none()
+            if repository_id is not None:
+                await session.execute(
+                    update(Repository)
+                    .where(Repository.id == repository_id)
+                    .values(
+                        indexing_status=(
+                            RepositoryIndexingStatus.QUEUED
+                            if should_retry
+                            else RepositoryIndexingStatus.FAILED
+                        ),
+                        indexing_stage="retry_wait" if should_retry else "failed",
+                        indexing_error_code=code,
+                        indexing_error_message=safe_message,
+                    )
+                )
+                delivery = await session.scalar(
+                    select(WebhookDelivery).where(WebhookDelivery.indexing_job_id == claimed.id)
+                )
+                if delivery is not None:
+                    delivery.status = (
+                        WebhookDeliveryStatus.RETRYABLE
+                        if should_retry
+                        else WebhookDeliveryStatus.FAILED
+                    )
+                    delivery.safe_error_code = code
+                    delivery.retry_count = claimed.attempt
+                    delivery.processed_at = None if should_retry else now
+            await session.commit()
+        return should_retry
+
+    async def recover_abandoned(self) -> int:
+        cutoff = datetime.now(UTC) - self._abandoned_after
+        async with self._database.session() as session:
+            jobs = tuple(
+                (
+                    await session.scalars(
+                        select(IndexingJob).where(
+                            IndexingJob.status == IndexingJobStatus.RUNNING,
+                            or_(
+                                IndexingJob.heartbeat_at.is_(None),
+                                IndexingJob.heartbeat_at < cutoff,
+                            ),
+                        )
+                    )
+                ).all()
+            )
+            for job in jobs:
+                retry = job.attempt < self._max_attempts
+                job.status = IndexingJobStatus.RETRYING if retry else IndexingJobStatus.FAILED
+                job.next_attempt_at = datetime.now(UTC) if retry else None
+                job.locked_by = None
+                job.error_code = "worker_abandoned"
+                job.safe_error_message = "Worker stopped before the job completed"
+                job.stage = "retry_wait" if retry else "failed"
+                if not retry:
+                    job.completed_at = datetime.now(UTC)
+                await session.execute(
+                    update(Repository)
+                    .where(Repository.id == job.repository_id)
+                    .values(
+                        indexing_status=(
+                            RepositoryIndexingStatus.QUEUED
+                            if retry
+                            else RepositoryIndexingStatus.FAILED
+                        ),
+                        indexing_stage=job.stage,
+                        indexing_error_code=job.error_code,
+                        indexing_error_message=job.safe_error_message,
+                    )
+                )
+                await session.execute(
+                    update(WebhookDelivery)
+                    .where(WebhookDelivery.indexing_job_id == job.id)
+                    .values(
+                        status=(
+                            WebhookDeliveryStatus.RETRYABLE
+                            if retry
+                            else WebhookDeliveryStatus.FAILED
+                        ),
+                        retry_count=job.attempt,
+                        safe_error_code="worker_abandoned",
+                        processed_at=None if retry else datetime.now(UTC),
+                    )
+                )
+            await session.commit()
+            return len(jobs)
+
+    async def due_jobs(self) -> Sequence[uuid.UUID]:
+        now = datetime.now(UTC)
+        duplicate_cutoff = now - self._abandoned_after
+        async with self._database.session() as session:
+            result = await session.scalars(
+                select(IndexingJob.id)
+                .where(
+                    IndexingJob.status.in_((IndexingJobStatus.QUEUED, IndexingJobStatus.RETRYING)),
+                    or_(
+                        IndexingJob.next_attempt_at.is_(None),
+                        IndexingJob.next_attempt_at <= now,
+                    ),
+                    or_(
+                        IndexingJob.last_enqueued_at.is_(None),
+                        IndexingJob.last_enqueued_at < duplicate_cutoff,
+                    ),
+                )
+                .order_by(IndexingJob.created_at)
+                .limit(100)
+            )
+            return tuple(result.all())
+
+    async def mark_enqueued(self, job_id: uuid.UUID) -> None:
+        async with self._database.session() as session:
+            await session.execute(
+                update(IndexingJob)
+                .where(
+                    IndexingJob.id == job_id,
+                    IndexingJob.status.in_((IndexingJobStatus.QUEUED, IndexingJobStatus.RETRYING)),
+                )
+                .values(last_enqueued_at=datetime.now(UTC))
+            )
+            await session.commit()
+
+    def _retry_delay(self, attempt: int) -> timedelta:
+        base = min(self._retry_max, self._retry_base * (2 ** max(0, attempt - 1)))
+        jitter_milliseconds = secrets.randbelow(base * 500 + 1)
+        return timedelta(seconds=base, milliseconds=jitter_milliseconds)
+
+    @staticmethod
+    def _activation_race() -> IndexingError:
+        return IndexingError(
+            code="index_activation_race",
+            message="The inactive index is no longer eligible for activation",
+            retryable=False,
+        )
+
+    @staticmethod
+    def _graph_validation_error() -> IndexingError:
+        return IndexingError(
+            code="call_graph_validation_failed",
+            message="The inactive static call graph failed validation",
+            retryable=False,
+        )
