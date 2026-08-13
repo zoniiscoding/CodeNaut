@@ -16,7 +16,7 @@ dependencies = [
   "pyjwt[crypto]==2.13.0",
   "pydantic==2.13.4",
   "pydantic-settings==2.14.2",
-  "qdrant-client==1.18.0",
+  "qdrant-client==1.19.0",
   "redis==8.0.1",
   "sqlalchemy[asyncio]==2.0.51",
   "structlog==26.1.0",
