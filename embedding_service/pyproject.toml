@@ -17,7 +17,7 @@ dependencies = [
   "pydantic-settings==2.14.2",
   "structlog==26.1.0",
   "tokenizers==0.22.2",
-  "uvicorn[standard]==0.51.0",
+  "uvicorn[standard]==0.52.1",
 ]
 
 [project.optional-dependencies]
