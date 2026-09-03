@@ -279,7 +279,7 @@ jobs:
           docker run --rm --entrypoint python repolume-embedding-service:ci --version | grep --fixed-strings 'Python 3.13'
 
       - name: Scan backend image
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: repolume-api:ci
           fail-build: true
@@ -287,7 +287,7 @@ jobs:
           only-fixed: true
 
       - name: Scan worker image
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: repolume-worker:ci
           fail-build: true
@@ -295,7 +295,7 @@ jobs:
           only-fixed: true
 
       - name: Scan embedding service image
-        uses: anchore/scan-action@e1165082ffb1fe366ebaf02d8526e7c4989ea9d2 # v7.4.0
+        uses: anchore/scan-action@27805bf3b4e84b4a5c980df22ed233c00390a439 # v7.4.2
         with:
           image: repolume-embedding-service:ci
           fail-build: true
